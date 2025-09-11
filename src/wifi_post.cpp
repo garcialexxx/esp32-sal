@@ -31,6 +31,8 @@ extern "C" void sdcard_newline(void);
 extern "C" void sdcard_append_jsonl(const char *chunk);
 /* Solicitar purga de líneas antiguas al writer (seguro y sin carreras) */
 extern "C" void sdjson_request_purge_older_than(uint32_t max_age_sec);
+/* ¿Hora real disponible? (NTP listo) */
+extern "C" bool netTimeReady(void);
 /* ───────────────────────────────────────────────────────────────────────── */
 
 #ifndef WIFI_SSID
@@ -42,7 +44,8 @@ extern "C" void sdjson_request_purge_older_than(uint32_t max_age_sec);
 #endif
 
 #ifndef POST_URL
-#define POST_URL "https://plataforma.phebus.net:443/api/v1/YQARkOKOcKThFSGIAWar/telemetry"
+//#define POST_URL "https://plataforma.phebus.net:443/api/v1/YQARkOKOcKThFSGIAWar/telemetry"
+#define POST_URL "https://plataforma.phebus.net:443/api/v1/Pl08nZ92k1eYZhXxj9ca/telemetry"
 #endif
 
 // Umbrales de memoria para intentar TLS
@@ -412,14 +415,21 @@ static void wifi_http_task(void *pvParameters) {
     }
     s_wasConnected = nowConnected;
 
-    // Si NO hay Wi-Fi ahora mismo: añadimos {t,w} y SELLAMOS el lote (simula intento de POST fallido)
+    // Si NO hay Wi-Fi ahora mismo:
     if (!nowConnected) {
-      char line[48];
-      snprintf(line, sizeof(line), "{\"t\":%lu,\"w\":%d}",
-               (unsigned long)m.ts, m.wifi);
-      sdcard_append_jsonl(line); // añade a la línea actual
-      sdcard_newline();          // salto de línea SOLO aquí (sin Wi-Fi = “intento” fallido)
-      Serial.println("[HTTP] Sin Wi-Fi: recuento guardado y lote sellado (equivalente a intento de POST).");
+      if (netTimeReady()) {
+        // añadimos {t,w} y SELLAMOS el lote (simula intento de POST fallido)
+        char line[64];
+        snprintf(line, sizeof(line), "{\"t\":%lu,\"w\":%d}",
+                 (unsigned long)m.ts, m.wifi);
+        sdcard_append_jsonl(line); // añade a la línea actual
+      } else {
+        Serial.println("[HTTP] Sin Wi-Fi y sin hora real: NO se guarda en SD.");
+      }
+
+      // Marcamos el “intento” (si la línea estaba vacía, el writer omitirá el '\n')
+      sdcard_newline();
+      Serial.println("[HTTP] Sin Wi-Fi: lote sellado (equivalente a intento de POST).");
       continue;
     }
 

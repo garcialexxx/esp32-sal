@@ -13,6 +13,13 @@
 #include <stdlib.h>
 #include <time.h>
 
+#include <sys/unistd.h>
+#include <sys/stat.h>
+
+#ifndef TAG
+#define TAG "sdcard"
+#endif
+
 sdmmc_card_t *card;
 
 const char mount_point[] = MOUNT_POINT;
@@ -50,8 +57,8 @@ int print_to_sd_card(const char *fmt, va_list args) {
 #endif
 
 static bool openFile(FILE **fd, const char *filename) {
-  char _filename[50];
-  sprintf(_filename, "%s%s", MOUNT_POINT, filename);
+  char _filename[128];
+  snprintf(_filename, sizeof(_filename), "%s%s", MOUNT_POINT, filename);
   *fd = fopen(_filename, "a");
   if (*fd == NULL) {
     ESP_LOGE(TAG, "file <%s> open error", _filename);
@@ -80,12 +87,17 @@ static bool openFile(FILE **fd, const char *filename) {
 #define SDJSON_RAW_MAXLEN  128
 #endif
 
-// Operaciones para el writer: appends sin salto, cierre de línea, ping/ack
-typedef enum { LOG_OP_APPEND = 0, LOG_OP_NEWLINE = 1, LOG_OP_PING = 2 } logop_t;
+// Operaciones para el writer: appends sin salto, cierre de línea, ping/ack, purga
+typedef enum {
+  LOG_OP_APPEND = 0,
+  LOG_OP_NEWLINE = 1,
+  LOG_OP_PING = 2,
+  LOG_OP_PURGE = 3   // NUEVO: purgar primeras líneas con edad > X
+} logop_t;
 
 typedef struct {
   logop_t op;
-  char    raw[SDJSON_RAW_MAXLEN]; // solo usado en APPEND
+  char    raw[SDJSON_RAW_MAXLEN]; // APPEND: payload; PURGE: "max_age_sec"
 } logrec_t;
 
 static QueueHandle_t s_log_queue   = NULL;
@@ -94,12 +106,12 @@ static FILE*         maclog_file   = NULL;
 
 // Estado interno: ¿ya se escribió algo en la línea actual?
 static bool s_line_has_items = false;
-// ACK para la versión síncrona del salto de línea
+// ACK para la versión síncrona del salto de línea (compartido también con PING)
 static volatile uint32_t s_newline_ack_counter = 0;
 
 static bool open_maclog_file(void) {
   if (maclog_file) return true;
-  char path[50];
+  char path[64];
   snprintf(path, sizeof(path), "/%s.jsonl", SDCARD_MACLOG_BASENAME);
   if (!openFile(&maclog_file, path)) {
     ESP_LOGE(TAG, "sdjson: can't open %s", path);
@@ -107,6 +119,130 @@ static bool open_maclog_file(void) {
   }
   return true;
 }
+
+/* ========= Helpers de PURGA (ejecutan dentro de la writer) ========== */
+
+// Leer primera línea y extraer el campo "t" (epoch). Devuelve true si OK.
+static bool get_first_line_ts(time_t &out_ts) {
+  char fullpath[96];
+  snprintf(fullpath, sizeof(fullpath), "%s/%s.jsonl", mount_point, SDCARD_MACLOG_BASENAME);
+  FILE* f = fopen(fullpath, "r");
+  if (!f) return false;
+
+  char buf[256];
+  size_t i = 0;
+  int c;
+  bool any = false;
+  while ((c = fgetc(f)) != EOF && c != '\n') {
+    if (c == '\r') continue;
+    if (i < sizeof(buf) - 1) buf[i++] = (char)c;
+    any = true;
+  }
+  fclose(f);
+  if (!any) return false;
+  buf[i] = '\0';
+
+  // Busca "t":<numero>
+  const char *p = strstr(buf, "\"t\"");
+  if (!p) p = strstr(buf, "t");
+  if (!p) return false;
+  p = strchr(p, ':');
+  if (!p) return false;
+  p++;
+  while (*p == ' ' || *p == '\t') p++;
+
+  unsigned long v = 0;
+  bool has = false;
+  while (*p >= '0' && *p <= '9') {
+    has = true;
+    v = (v * 10ul) + (unsigned)(*p - '0');
+    p++;
+  }
+  if (!has) return false;
+  out_ts = (time_t)v;
+  return true;
+}
+
+// Borrar N primeras líneas (versión sin parar cola; la writer cierra/reabre FILE).
+static bool sdjson_delete_first_lines_nolock(size_t n) {
+  if (n == 0) return true;
+
+  char fullpath[96];
+  snprintf(fullpath, sizeof(fullpath), "%s/%s.jsonl", mount_point, SDCARD_MACLOG_BASENAME);
+  char tmppath[96];
+  snprintf(tmppath,  sizeof(tmppath),  "%s/%s.tmp",   mount_point, SDCARD_MACLOG_BASENAME);
+
+  FILE* fin = fopen(fullpath, "r");
+  if (!fin) return true; // no hay nada que borrar
+
+  FILE* ftmp = fopen(tmppath, "w");
+  if (!ftmp) { fclose(fin); return false; }
+
+  size_t to_skip = n;
+  int c;
+  bool saw_any = false;
+  bool last_was_nl = true;
+
+  // 1) Saltar exactamente N líneas completas (cuenta '\n')
+  while (to_skip > 0 && (c = fgetc(fin)) != EOF) {
+    saw_any = true;
+    if (c == '\r') continue;
+    last_was_nl = (c == '\n');
+    if (last_was_nl) to_skip--;
+  }
+  // Si EOF y última no tenía '\n' pero vimos algo, considérala línea
+  if (to_skip > 0 && saw_any && !last_was_nl) {
+    to_skip--;
+  }
+
+  // 2) Copiar el resto tal cual
+  if (to_skip == 0) {
+    while ((c = fgetc(fin)) != EOF) {
+      fputc(c, ftmp);
+    }
+  }
+
+  fflush(ftmp); fsync(fileno(ftmp));
+  fclose(ftmp);
+  fclose(fin);
+
+  // 3) Reemplazo atómico
+  remove(fullpath);
+  rename(tmppath, fullpath);
+
+  return true;
+}
+
+// Ejecuta purga hasta que la primera línea esté < max_age_sec (24h)
+// Cierra maclog_file, borra lo viejo, y vuelve a abrir en APPEND.
+static void do_purge_older_than(uint32_t max_age_sec) {
+  // Asegurar que los datos en FILE actual están en disco
+  if (maclog_file) {
+    fflush(maclog_file);
+    fsync(fileno(maclog_file));
+    fclose(maclog_file);
+    maclog_file = NULL;
+  }
+
+  time_t now = time(NULL);
+
+  for (;;) {
+    time_t first_ts = 0;
+    if (!get_first_line_ts(first_ts)) break;      // no hay líneas
+    if (first_ts > now) break;                    // timestamp futuro: no purgar
+    if ((uint32_t)(now - first_ts) > max_age_sec) {
+      (void)sdjson_delete_first_lines_nolock(1);  // borra 1ª línea y reevalúa
+      continue;
+    }
+    break; // la primera línea es reciente (< max_age_sec)
+  }
+
+  // Reabrir fichero para seguir escribiendo
+  (void)open_maclog_file();
+  s_line_has_items = false; // nueva línea empezará sin coma
+}
+
+/* =================== TAREA WRITER =================== */
 
 static void maclog_writer_task(void* arg) {
   logrec_t r;
@@ -132,9 +268,18 @@ static void maclog_writer_task(void* arg) {
       ESP_LOGI(TAG, "sdjson: NEWLINE escrito (pos=%ld, ack=%u)",
                pos, (unsigned)s_newline_ack_counter);
 
+    } else if (r.op == LOG_OP_PURGE) {
+      uint32_t max_age = 86400; // por defecto 24h
+      if (r.raw[0]) {
+        unsigned long v = strtoul(r.raw, NULL, 10);
+        if (v > 0) max_age = (uint32_t)v;
+      }
+      ESP_LOGI(TAG, "sdjson: PURGE older than %u s (offline)", (unsigned)max_age);
+      do_purge_older_than(max_age);
+
     } else { // LOG_OP_PING
-      // Conserva el comportamiento previo (ACK compartido)
-      s_newline_ack_counter++;
+      // No escribimos nada; sirve para asegurar que la tarea corre
+      s_newline_ack_counter++;  // Reutilizamos el contador para ping/ack
     }
 
     if (++n_since_flush >= SDJSON_FLUSH_EVERY) {
@@ -143,7 +288,6 @@ static void maclog_writer_task(void* arg) {
     }
   }
 }
-
 
 bool sdjson_logger_start(void) {
   if (!useSDCard) return false;
@@ -276,7 +420,7 @@ bool sdcard_init(bool create) {
   ESP_LOGI(TAG, "filesystem mounted");
   sdmmc_card_print_info(stdout, card);
 
-  char bufferFilename[50];
+  char bufferFilename[64];
   snprintf(bufferFilename, sizeof(bufferFilename), "/%s.json", SDCARD_FILE_NAME);
 
   if (openFile(&data_file, bufferFilename)) {
@@ -376,8 +520,8 @@ extern "C" bool sdjson_read_batch(String &outEventsArray,
   // Paramos el writer para consistencia
   sdjson_logger_stop();
 
-  char fullpath[64];
-  sprintf(fullpath, "%s/%s.jsonl", mount_point, SDCARD_MACLOG_BASENAME);
+  char fullpath[96];
+  snprintf(fullpath, sizeof(fullpath), "%s/%s.jsonl", mount_point, SDCARD_MACLOG_BASENAME);
 
   FILE* fin = fopen(fullpath, "r");
   if (!fin) {
@@ -451,10 +595,10 @@ extern "C" bool sdjson_delete_first_lines(size_t n) {
   // Detenemos el writer para tener control exclusivo del archivo
   sdjson_logger_stop();
 
-  char fullpath[64];
-  sprintf(fullpath, "%s/%s.jsonl", mount_point, SDCARD_MACLOG_BASENAME);
-  char tmppath[64];
-  sprintf(tmppath,  "%s/%s.tmp",   mount_point, SDCARD_MACLOG_BASENAME);
+  char fullpath[96];
+  snprintf(fullpath, sizeof(fullpath), "%s/%s.jsonl", mount_point, SDCARD_MACLOG_BASENAME);
+  char tmppath[96];
+  snprintf(tmppath,  sizeof(tmppath),  "%s/%s.tmp",   mount_point, SDCARD_MACLOG_BASENAME);
 
   FILE* fin = fopen(fullpath, "r");
   if (!fin) { sdjson_logger_start(); return true; }
@@ -497,6 +641,22 @@ extern "C" bool sdjson_delete_first_lines(size_t n) {
   // Reanudamos el writer
   sdjson_logger_start();
   return true;
+}
+
+/* API pública: pedir PURGA al writer (se encola, sin carreras) */
+extern "C" void sdjson_request_purge_older_than(uint32_t max_age_sec) {
+  if (!s_log_queue) return;
+  logrec_t r = {};
+  r.op = LOG_OP_PURGE;
+  snprintf(r.raw, sizeof(r.raw), "%lu", (unsigned long)max_age_sec);
+
+  if (xPortInIsrContext()) {
+    BaseType_t hpw = pdFALSE;
+    (void)xQueueSendFromISR(s_log_queue, &r, &hpw);
+    if (hpw) portYIELD_FROM_ISR();
+  } else {
+    (void)xQueueSend(s_log_queue, &r, 0);
+  }
 }
 
 #endif // HAS_SDCARD

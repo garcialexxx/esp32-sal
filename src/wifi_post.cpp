@@ -29,6 +29,8 @@ extern "C" bool sdcard_newline_sync(uint32_t timeout_ms);
 extern "C" void sdcard_newline(void);
 /* APPEND para {t,w} cuando no hay Wi-Fi */
 extern "C" void sdcard_append_jsonl(const char *chunk);
+/* Solicitar purga de líneas antiguas al writer (seguro y sin carreras) */
+extern "C" void sdjson_request_purge_older_than(uint32_t max_age_sec);
 /* ───────────────────────────────────────────────────────────────────────── */
 
 #ifndef WIFI_SSID
@@ -70,6 +72,7 @@ typedef struct {
 
 static QueueHandle_t gWifiHttpQueue = nullptr;
 static TaskHandle_t  gWifiHttpTask  = nullptr;
+static TaskHandle_t  gPurgeTask     = nullptr;
 
 /* Estado de sesión Wi-Fi: queremos 1 solo POST por conexión */
 static bool s_wasConnected = false;
@@ -268,11 +271,9 @@ private:
           else { ungetc(c, _f); break; }
           _need_comma_between_lines = false;
         }
-        // sigue para procesar 'c' como parte de la línea
       }
 
       if (c == '\n') {
-        // fin de la línea
         _in_line = false;
         _need_comma_between_lines = true;
         if (_buf_len == 0) continue;
@@ -282,7 +283,6 @@ private:
           _buf[_buf_len++] = (uint8_t)c;
           _line_started = true;
         } else {
-          // buffer lleno: devolvemos ahora y seguimos luego
           break;
         }
       }
@@ -455,6 +455,24 @@ static void wifi_http_task(void *pvParameters) {
   }
 }
 
+/* ── TAREA PERIÓDICA: purga cada 6 minutos cuando no hay Internet ───────── */
+
+static void backlog_purge_task(void *pvParameters) {
+  (void)pvParameters;
+  const uint32_t kIntervalMs = 6 * 60 * 1000; // 6 minutos
+  const uint32_t kMaxAgeSecs = 24 * 60 * 60;  // 24 horas
+
+  for (;;) {
+    vTaskDelay(pdMS_TO_TICKS(kIntervalMs));
+
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("[PURGE] Offline: solicitando purga de líneas > 24h...");
+      // Lo hace la tarea writer, sin carreras
+      sdjson_request_purge_older_than(kMaxAgeSecs);
+    }
+  }
+}
+
 /* ────────────────────────────────────────────────────────────────────────── */
 
 void wifi_post_init(void) {
@@ -467,6 +485,11 @@ void wifi_post_init(void) {
     // Subimos el stack para evitar “Double exception”
     xTaskCreatePinnedToCore(
       wifi_http_task, "wifi_http_task", 12288, NULL, 1, &gWifiHttpTask, 1
+    );
+  }
+  if (!gPurgeTask) {
+    xTaskCreatePinnedToCore(
+      backlog_purge_task, "sd_purge_task", 4096, NULL, 1, &gPurgeTask, 1
     );
   }
 }

@@ -1,10 +1,17 @@
 // Basic Config
 #include "senddata.h"
-#include "wifi_post.h"   // <- para wifi_post_counts(...)
-#include <time.h>        // <- para time(nullptr)
+#include "wifi_post.h"   // wifi_post_counts(...)
+#include <time.h>        // time(nullptr)
+#include <Arduino.h>     // millis()
+
+// --- marcas de tiempo compartidas con el watchdog (definidas en wifi_post.cpp) ---
+extern volatile uint32_t gLastHttpOkTs;   // se actualiza en wifi_post al 200 OK
+extern volatile uint32_t gLastHttpTryTs;  // se actualiza en wifi_post antes de intentar
+extern volatile uint32_t gLastSendDataTs; // “latido” desde sendData()
+volatile uint32_t gLastSendDataTs = 0;
 
 // void setSendIRQ(TimerHandle_t xTimer) {
-//  xTaskNotify(irqHandlerTask, SENDCYCLE_IRQ, eSetBits);
+//   xTaskNotify(irqHandlerTask, SENDCYCLE_IRQ, eSetBits);
 //}
 
 // void setSendIRQ(void) { setSendIRQ(NULL); }
@@ -46,10 +53,16 @@ void SendPayload(uint8_t port) {
   }
   memcpy(SendBuffer.Message, payload.getBuffer(), SendBuffer.MessageSize);
 
-// enqueue message in device's send queues
+  // enqueue message in device's send queues
+
+  // --- Desactivar LoRa: mantener exactamente como lo tenías ---
+#if 0
 #if (HAS_LORA)
   lora_enqueuedata(&SendBuffer);
 #endif
+#endif
+  // -----------------------------------------------------------
+
 #ifdef HAS_SPI
   spi_enqueuedata(&SendBuffer);
 #endif
@@ -60,6 +73,9 @@ void SendPayload(uint8_t port) {
 
 // timer triggered function to prepare payload to send
 void sendData() {
+  // --- latido para el watchdog: si sendData deja de correr, el WDT lo detecta ---
+  gLastSendDataTs = millis();
+
   uint8_t bitmask = cfg.payloadmask;
   uint8_t mask = 1;
 
@@ -112,26 +128,14 @@ void sendData() {
       dp_plotCurve(count.pax, true);
 #endif
 
-#if (HAS_SDCARD)
-      sdcardWriteData(count.wifi_count, count.ble_count
-#if (defined BAT_MEASURE_ADC || defined HAS_PMU)
-                      ,
-                      read_voltage()
-#endif
-      );
-#endif // HAS_SDCARD
-
-      // Envío LoRa (como siempre)
       SendPayload(COUNTERPORT);
 
-      // **** NUEVO: Disparar POST HTTP en el mismo ciclo de envío ****
-      // (usa la tarea de wifi_post.cpp para construir y enviar,
-      //  leyendo el backlog NDJSON de la SD y borrando el lote si OK)
+      // **** Disparar POST HTTP en el mismo ciclo de envío ****
       {
-wifi_post_counts(count.wifi_count, time(nullptr));
-
+        // Importante: wifi_post_counts actualiza marcas de intento/OK
+        wifi_post_counts(count.wifi_count, time(nullptr));
       }
-      // ****************************************************************
+      // ********************************************************
 
       break; // case COUNT_DATA
 

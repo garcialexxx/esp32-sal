@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -12,6 +13,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include <esp_heap_caps.h>
 extern "C" {
@@ -44,8 +46,8 @@ extern "C" bool netTimeReady(void);
 #endif
 
 #ifndef POST_URL
-//#define POST_URL "https://plataforma.phebus.net:443/api/v1/YQARkOKOcKThFSGIAWar/telemetry"
-#define POST_URL "https://plataforma.phebus.net:443/api/v1/Pl08nZ92k1eYZhXxj9ca/telemetry"
+#define POST_URL "https://plataforma.phebus.net:443/api/v1/YQARkOKOcKThFSGIAWar/telemetry"
+//#define POST_URL "https://plataforma.phebus.net:443/api/v1/Pl08nZ92k1eYZhXxj9ca/telemetry"
 #endif
 
 // Umbrales de memoria para intentar TLS
@@ -77,9 +79,14 @@ static QueueHandle_t gWifiHttpQueue = nullptr;
 static TaskHandle_t  gWifiHttpTask  = nullptr;
 static TaskHandle_t  gPurgeTask     = nullptr;
 
-/* Estado de sesión Wi-Fi: queremos 1 solo POST por conexión */
-static bool s_wasConnected = false;
-static bool s_flushedThisConnection = false;
+// --- Watchdog / diagnóstico de POST ---
+static TaskHandle_t  gPostResetTask = nullptr;
+// ticks de FreeRTOS para medir progreso real de POST
+static volatile uint32_t gLastPostOkTick  = 0; // último POST OK completado
+static volatile uint32_t gLastPostTryTick = 0; // instante en que entramos en sendRequest()
+
+// Reboot orquestado (para evitar bloqueos antes del restart)
+static volatile bool gRebootScheduled = false;
 
 /* ────────────────────────────────────────────────────────────────────────── */
 
@@ -311,6 +318,29 @@ private:
 
 /* ────────────────────────────────────────────────────────────────────────── */
 
+static void rebooter_task(void *arg) {
+  (void)arg;
+  // pequeño retardo para que salgan logs por UART/USB
+  for (int i=0; i<5; ++i) {
+    Serial.println("[WATCHDOG] Reinicio programado...");
+    vTaskDelay(pdMS_TO_TICKS(200));
+  }
+  esp_restart(); // no retorna
+  vTaskDelete(NULL);
+}
+
+static void schedule_reboot_nonblocking(const char* reason) {
+  if (gRebootScheduled) return;
+  gRebootScheduled = true;
+
+  Serial.printf("[WATCHDOG] %s\n", reason ? reason : "Reinicio solicitado");
+  // Evitar operaciones bloqueantes aquí. Solo un sellado asíncrono (no bloquea).
+  sdcard_newline();
+
+  // Alta prioridad, cualquier core
+  xTaskCreatePinnedToCore(rebooter_task, "rebooter", 3072, NULL, configMAX_PRIORITIES - 1, NULL, tskNO_AFFINITY);
+}
+
 static bool post_all_in_one_stream(int wifiCount, time_t ts, size_t& out_lines_sent) {
   out_lines_sent = 0;
 
@@ -352,8 +382,11 @@ static bool post_all_in_one_stream(int wifiCount, time_t ts, size_t& out_lines_s
 
   WiFiClientSecure client;
   client.setInsecure();
+  client.setTimeout(8000);          // socket RX/TX timeout
+
   HTTPClient http;
-  http.setTimeout(8000);
+  http.setConnectTimeout(5000);     // timeout de conexión TCP
+  http.setTimeout(12000);           // timeout de lectura/cabeceras
 
   if (!http.begin(client, POST_URL)) {
     Serial.println("[HTTP] begin() falló");
@@ -364,17 +397,26 @@ static bool post_all_in_one_stream(int wifiCount, time_t ts, size_t& out_lines_s
   NdjsonArrayStream streamer(fullpath, prefix, prefix_len, suffix, suffix_len);
   streamer.begin();
 
+  // Marcar inicio real del intento de POST (para WD)
+  gLastPostTryTick = xTaskGetTickCount();
+
   int code = http.sendRequest("POST", &streamer, content_len);
 
   streamer.end();
 
   bool ok = (code > 0 && code < 400);
   if (ok) {
+    gLastPostOkTick = xTaskGetTickCount();  // marca último POST OK
     Serial.printf("[HTTP] POST OK (%d)  (lines=%u bytes=%u)\n",
                   code, (unsigned)st.lines, (unsigned)st.bytes);
     out_lines_sent = st.lines;
   } else {
+#if defined(HTTPCLIENT_1_2_COMPATIBLE) || ARDUINO
+    Serial.printf("[HTTP] POST FAIL (%d) %s\n", code,
+                  HTTPClient::errorToString(code).c_str());
+#else
     Serial.printf("[HTTP] POST FAIL (%d)\n", code);
+#endif
   }
 
   http.end();
@@ -394,26 +436,17 @@ static void wifi_http_task(void *pvParameters) {
   http_msg_t m;
 
   for (;;) {
+    // Si ya hay un reinicio programado, cedemos CPU hasta que se reinicie
+    if (gRebootScheduled) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
+
     // Espera *solo* a que llegue un recuento real
     if (xQueueReceive(gWifiHttpQueue, &m, portMAX_DELAY) != pdTRUE)
       continue;
 
-    // Observa transición de estado Wi-Fi
+    // Asegura conexión antes de postear
     bool nowConnected = (WiFi.status() == WL_CONNECTED);
     if (!nowConnected) (void)connectToWiFi_local(3000);
     nowConnected = (WiFi.status() == WL_CONNECTED);
-
-    // Si acabamos de conectar (antes no lo estábamos) -> permite flush único
-    if (nowConnected && !s_wasConnected) {
-      s_flushedThisConnection = false;
-      Serial.println("[WIFI] Conectado: listo para 1 solo POST de vaciado.");
-    }
-    // Si nos hemos caído, resetea bandera para la próxima conexión
-    if (!nowConnected && s_wasConnected) {
-      s_flushedThisConnection = false;
-      Serial.println("[WIFI] Desconectado: se permitirá un POST cuando reconecte.");
-    }
-    s_wasConnected = nowConnected;
 
     // Si NO hay Wi-Fi ahora mismo:
     if (!nowConnected) {
@@ -433,13 +466,7 @@ static void wifi_http_task(void *pvParameters) {
       continue;
     }
 
-    // Ya hay Wi-Fi: solo permitimos 1 POST por conexión
-    if (s_flushedThisConnection) {
-      Serial.println("[HTTP] Ya se vació en esta conexión; no se postea de nuevo.");
-      continue;
-    }
-
-    // Hacemos el POST único: envía TODO lo que haya en la SD en ESTE instante
+    // HAY Wi-Fi -> SIEMPRE intentar POST de TODO lo que haya ahora
     size_t sent = 0;
     bool ok = post_all_in_one_stream(m.wifi, m.ts, sent);
 
@@ -449,7 +476,7 @@ static void wifi_http_task(void *pvParameters) {
         Serial.printf("[HTTP] WARNING: no pude borrar %u lineas del backlog\n",
                       (unsigned)sent);
       }
-    } else {
+    } else if (!ok) {
       // Intento de POST fallido: SELLAMOS lote para marcar el corte
       Serial.println("[HTTP] POST FAIL -> lote sellado; no se borra backlog.");
       sdcard_newline();  // salto de línea SOLO cuando el POST falla
@@ -457,9 +484,6 @@ static void wifi_http_task(void *pvParameters) {
 
     // Re-arrancamos el writer aquí (después de borrar o decidir no borrar)
     sdjson_logger_start();
-
-    // Marcar que ya vaciamos en esta conexión
-    s_flushedThisConnection = true;
 
     vTaskDelay(pdMS_TO_TICKS(10));
   }
@@ -470,7 +494,7 @@ static void wifi_http_task(void *pvParameters) {
 static void backlog_purge_task(void *pvParameters) {
   (void)pvParameters;
   const uint32_t kIntervalMs = 6 * 60 * 1000; // 6 minutos
-  const uint32_t kMaxAgeSecs = 24 * 60 * 60;  // 24 horas
+  const uint32_t kMaxAgeSecs = 48 * 60 * 60;  // 48h
 
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(kIntervalMs));
@@ -479,6 +503,70 @@ static void backlog_purge_task(void *pvParameters) {
       Serial.println("[PURGE] Offline: solicitando purga de líneas > 24h...");
       // Lo hace la tarea writer, sin carreras
       sdjson_request_purge_older_than(kMaxAgeSecs);
+    }
+  }
+}
+
+/* ── WATCHDOG: reiniciar si hay Wi-Fi pero 10 min sin progreso de POST ──── */
+
+static void post_reset_watchdog_task(void *pvParameters) {
+  (void)pvParameters;
+  const uint32_t kCheckPeriodMs = 60000;          // comprobación cada 1 min
+  const uint32_t kNoPostLimitMs = 10 * 60 * 1000; // 10 minutos
+
+  for (;;) {
+    vTaskDelay(pdMS_TO_TICKS(kCheckPeriodMs));
+
+    if (gRebootScheduled) continue;
+
+    const wl_status_t st = WiFi.status();
+    if (st != WL_CONNECTED) {
+      Serial.printf("[WATCHDOG] WiFi no conectado (status=%d) -> no actúa\n", (int)st);
+      continue;
+    }
+
+    // Diagnóstico de cola y backlog
+    UBaseType_t qdepth = gWifiHttpQueue ? uxQueueMessagesWaiting(gWifiHttpQueue) : 0;
+    char fullpath[96];
+    snprintf(fullpath, sizeof(fullpath), "%s/%s.jsonl", MOUNT_POINT, SDCARD_MACLOG_BASENAME);
+    NdjsonStats stats = {};
+    (void)compute_ndjson_stats(fullpath, stats);
+
+    // Memoria para TLS disponible
+    size_t freeHeap   = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+    size_t largestBlk = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
+    bool tls_ok = have_tls_memory();
+
+    // Tiempos
+    uint32_t nowTick  = xTaskGetTickCount();
+    uint32_t lastTry  = gLastPostTryTick;
+    uint32_t lastOk   = gLastPostOkTick;
+    uint32_t sinceTry = (lastTry > 0) ? (nowTick - lastTry) * portTICK_PERIOD_MS : 0;
+    uint32_t sinceOk  = (lastOk  > 0) ? (nowTick - lastOk)  * portTICK_PERIOD_MS : 0;
+
+    Serial.printf(
+      "[WATCHDOG] diag: qdepth=%u, backlog_lines=%u bytes=%u, TLSmem_ok=%d (free=%u largest=%u), "
+      "sinceTry=%ums, sinceOk=%ums\n",
+      (unsigned)qdepth, (unsigned)stats.lines, (unsigned)stats.bytes,
+      tls_ok ? 1 : 0, (unsigned)freeHeap, (unsigned)largestBlk,
+      (unsigned)sinceTry, (unsigned)sinceOk
+    );
+
+    // ¿10 min sin progreso (ni OK, ni fin de intento)?
+    uint32_t lastActivityTick = (lastOk > lastTry) ? lastOk : lastTry;
+    if (lastActivityTick == 0) {
+      // aún no hemos intentado/OK -> no hacer nada
+      continue;
+    }
+    uint32_t elapsedMs = (nowTick - lastActivityTick) * portTICK_PERIOD_MS;
+
+    if (elapsedMs >= kNoPostLimitMs) {
+      if (lastTry > lastOk) {
+        schedule_reboot_nonblocking("Posible cuelgue en sendRequest(): 10 min sin finalizar intento");
+      } else {
+        schedule_reboot_nonblocking("10 min sin POST OK con Wi-Fi");
+      }
+      // no hacer nada más aquí; el rebooter se encargará
     }
   }
 }
@@ -502,10 +590,22 @@ void wifi_post_init(void) {
       backlog_purge_task, "sd_purge_task", 4096, NULL, 1, &gPurgeTask, 1
     );
   }
+  if (!gPostResetTask) {
+    // Inicializa marcas a "ahora" para evitar falso positivo al arranque
+    uint32_t nowTick = xTaskGetTickCount();
+    gLastPostTryTick = nowTick;
+    gLastPostOkTick  = nowTick;
+
+    xTaskCreatePinnedToCore(
+      post_reset_watchdog_task, "post_reset_wd", 3072, NULL, 1, &gPostResetTask, 1
+    );
+  }
 }
 
 void wifi_post_counts(int wifi, time_t ts) {
   if (!gWifiHttpQueue) return;
   http_msg_t m { wifi, ts };
-  (void) xQueueSend(gWifiHttpQueue, &m, 0);
+  if (xQueueSend(gWifiHttpQueue, &m, 0) != pdTRUE) {
+    Serial.println("[HTTP] queue full -> dropped");
+  }
 }

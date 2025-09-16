@@ -242,6 +242,117 @@ static void do_purge_older_than(uint32_t max_age_sec) {
   s_line_has_items = false; // nueva línea empezará sin coma
 }
 
+/* === Saneado del backlog NDJSON al arrancar ===
+   - Elimina líneas vacías o obviamente corruptas (no empiezan por '{' o no acaban en '}').
+   - Si hay "t":<num>, valida rango (no futuro y no prehistórico) y normaliza ms/seg al comparar.
+   - Reescribe el archivo con solo líneas válidas y fuerza '\n' final.
+   - No usa la cola: se ejecuta antes de arrancar el writer. */
+static void sdjson_sanity_check_on_boot(void) {
+  if (!useSDCard) return;
+
+  char fullpath[96];
+  snprintf(fullpath, sizeof(fullpath), "%s/%s.jsonl", mount_point, SDCARD_MACLOG_BASENAME);
+
+  FILE* fin = fopen(fullpath, "r");
+  if (!fin) {
+    ESP_LOGI(TAG, "sdjson: no backlog to check on boot");
+    return;
+  }
+
+  char tmppath[96];
+  snprintf(tmppath, sizeof(tmppath), "%s/%s.sane", mount_point, SDCARD_MACLOG_BASENAME);
+  FILE* ftmp = fopen(tmppath, "w");
+  if (!ftmp) {
+    ESP_LOGW(TAG, "sdjson: can't create tmp for sanity; skipping");
+    fclose(fin);
+    return;
+  }
+
+  // Umbrales de tiempo
+  const time_t now = time(NULL);
+  const bool   now_ok = (now > 1577836800);     // >= 2020-01-01
+  const time_t min_ok = 1483228800;             // 2017-01-01
+  const time_t max_future = now_ok ? (now + 86400) : (time_t)4102444800; // +1 día si hay hora, si no laxo
+
+  size_t kept = 0, dropped = 0;
+
+  String line;
+  line.reserve(256);
+  int c;
+
+  auto process_line = [&](String& s) {
+    while (s.length() && (s[s.length()-1] == '\r' || s[s.length()-1] == '\n' || s[s.length()-1] == ' ' || s[s.length()-1] == '\t'))
+      s.remove(s.length()-1);
+    int start = 0;
+    while (start < (int)s.length() && (s[start] == ' ' || s[start] == '\t')) start++;
+
+    if (start >= (int)s.length()) { dropped++; return; }
+    if (s[start] != '{') { dropped++; return; }
+    if (s[s.length()-1] != '}') { dropped++; return; }
+
+    // Si hay campo t, validar
+    time_t tval = 0;
+    bool have_t = false;
+    int idx_t = s.indexOf("\"t\"", start);
+    if (idx_t < 0) idx_t = s.indexOf('t', start); // tolerante
+    if (idx_t >= 0) {
+      int colon = s.indexOf(':', idx_t);
+      if (colon > 0) {
+        int p = colon + 1;
+        while (p < (int)s.length() && (s[p] == ' ' || s[p] == '\t')) p++;
+        unsigned long long val = 0ULL;
+        bool any = false;
+        while (p < (int)s.length() && s[p] >= '0' && s[p] <= '9') {
+          any = true;
+          val = val * 10ULL + (unsigned)(s[p] - '0');
+          p++;
+        }
+        if (any) {
+          if (val > 100000000000ULL) { // ms
+            tval = (time_t)(val / 1000ULL);
+          } else {
+            tval = (time_t)val;
+          }
+          have_t = true;
+        }
+      }
+    }
+
+    if (have_t) {
+      if (tval < min_ok) { dropped++; return; }
+      if (tval > max_future) { dropped++; return; }
+    }
+
+    fwrite(s.c_str(), 1, s.length(), ftmp);
+    fputc('\n', ftmp);
+    kept++;
+  };
+
+  while ((c = fgetc(fin)) != EOF) {
+    if (c == '\r') continue;
+    if (c == '\n') {
+      if (line.length()) process_line(line);
+      line = "";
+      continue;
+    }
+    line += (char)c;
+    if (line.length() > 8192) {
+      process_line(line);
+      line = "";
+    }
+  }
+  if (line.length()) process_line(line);
+
+  fflush(ftmp); fsync(fileno(ftmp));
+  fclose(ftmp);
+  fclose(fin);
+
+  remove(fullpath);
+  rename(tmppath, fullpath);
+
+  ESP_LOGI(TAG, "sdjson: sanity on boot -> kept=%u dropped=%u", (unsigned)kept, (unsigned)dropped);
+}
+
 /* =================== TAREA WRITER =================== */
 
 static void maclog_writer_task(void* arg) {
@@ -278,7 +389,7 @@ static void maclog_writer_task(void* arg) {
       do_purge_older_than(max_age);
 
     } else { // LOG_OP_PING
-      // No escribimos nada; sirve para asegurar que la tarea corre
+      // No escribimos nada; sirve para asegurar que está viva
       s_newline_ack_counter++;  // Reutilizamos el contador para ping/ack
     }
 
@@ -420,27 +531,12 @@ bool sdcard_init(bool create) {
   ESP_LOGI(TAG, "filesystem mounted");
   sdmmc_card_print_info(stdout, card);
 
-  char bufferFilename[64];
-  snprintf(bufferFilename, sizeof(bufferFilename), "/%s.json", SDCARD_FILE_NAME);
-
-  if (openFile(&data_file, bufferFilename)) {
-    fpos_t position;
-    fgetpos(data_file, &position);
-    if (position == 0) {
-      fprintf(data_file, "%s", SDCARD_FILE_HEADER);
-#if (defined BAT_MEASURE_ADC || defined HAS_PMU)
-      fprintf(data_file, "%s", SDCARD_FILE_HEADER_VOLTAGE);
-#endif
-#if (HAS_SDS011)
-      fprintf(data_file, "%s", SDCARD_FILE_HEADER_SDS011);
-#endif
-      fprintf(data_file, "\n");
-    }
-  } else {
-    useSDCard = false;
-  }
+  // *** CAMBIO MINIMO: NO crear el fichero clásico paxcounter_*.json ***
+  // (Se deja data_file en nullptr para que sdcardWriteData no escriba nada)
+  data_file = nullptr;
 
 #if (SDLOGGING)
+  char bufferFilename[64];
   snprintf(bufferFilename, sizeof(bufferFilename), "/%s.log", SDCARD_FILE_NAME);
   if (openFile(&log_file, bufferFilename)) {
     ESP_LOGI(TAG, "redirecting serial output to SD-card");
@@ -449,6 +545,9 @@ bool sdcard_init(bool create) {
     useSDCard = false;
   }
 #endif
+
+  // Sanea backlog NDJSON al arranque ANTES de iniciar el writer
+  sdjson_sanity_check_on_boot();
 
   sdjson_logger_start();
   return useSDCard;
@@ -478,7 +577,8 @@ void sdcard_close(void) {
 
 void sdcardWriteData(uint16_t noWifi, uint16_t noBle,
                      __attribute__((unused)) uint16_t voltage) {
-  if (!useSDCard) return;
+  // *** CAMBIO MINIMO: no escribir si no hay fichero clásico abierto ***
+  if (!useSDCard || data_file == nullptr) return;
 
   char timeBuffer[21];
   time_t t = time(NULL);

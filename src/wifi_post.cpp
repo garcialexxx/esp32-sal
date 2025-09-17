@@ -48,8 +48,9 @@ extern "C" bool netTimeReady(void);
 #endif
 
 #ifndef POST_URL
-#define POST_URL "https://plataforma.phebus.net:443/api/v1/YQARkOKOcKThFSGIAWar/telemetry"
+//#define POST_URL "https://plataforma.phebus.net:443/api/v1/YQARkOKOcKThFSGIAWar/telemetry"
 //#define POST_URL "https://plataforma.phebus.net:443/api/v1/Pl08nZ92k1eYZhXxj9ca/telemetry"
+#define POST_URL "https://plataforma.phebus.net:443/api/v1/4b4Fm1WfHCIEf8kFQPxU/telemetry"
 #endif
 
 // Umbrales de memoria para intentar TLS
@@ -643,9 +644,9 @@ static void schedule_reboot_nonblocking(const char* reason) {
 /**
  * @brief Envía el contenido de un archivo específico vía POST.
  *        (Con diagnóstico y saneado previo de datos incompletos)
- *        CORREGIDO: recuento_max = nº de objetos realmente presentes.
+ *        CORREGIDO: recuento_max = contador actual (momento del envío).
  */
-static bool post_file_and_delete_on_ok(const char* fullpath, int /*wifiCount*/, time_t ts) {
+static bool post_file_and_delete_on_ok(const char* fullpath, int wifiCount, time_t ts) {
     NdjsonStats st = {};
     (void)compute_ndjson_stats(fullpath, st);
 
@@ -676,22 +677,14 @@ static bool post_file_and_delete_on_ok(const char* fullpath, int /*wifiCount*/, 
         return true; // nada que enviar, no es error
     }
 
-    // === Conteo real de eventos (objetos top-level) en el snapshot saneado ===
+    // (Opcional) Conteo real de eventos en el snapshot saneado (diagnóstico)
     size_t eventos_reales = count_events_in_file(fullpath);
     Serial.printf("[HTTP] eventos reales en snapshot: %u\n", (unsigned)eventos_reales);
 
-    if (eventos_reales == 0) {
-        // Saneado dejó algo raro (p. ej., solo espacios). No enviamos.
-        remove(fullpath);
-        gLastPostOkTick = xTaskGetTickCount();
-        Serial.println("[HTTP] Snapshot sin objetos tras saneado -> no posteo.");
-        return true;
-    }
-
-    // Construimos el JSON contenedor
+    // Construimos el JSON contenedor con recuento_max = contador del momento del envío
     char prefix[128];
-    snprintf(prefix, sizeof(prefix), "{\"recuento_max\":%u,\"ts\":%lu,\"events\":[",
-             (unsigned)eventos_reales, (unsigned long)ts);
+    snprintf(prefix, sizeof(prefix), "{\"recuento_max\":%d,\"ts\":%lu,\"events\":[",
+             wifiCount, (unsigned long)ts);
     const size_t prefix_len = strlen(prefix);
 
     static const char suffix[] = "]}";
@@ -744,11 +737,20 @@ static bool post_file_and_delete_on_ok(const char* fullpath, int /*wifiCount*/, 
             Serial.printf("[HTTP] WARNING: no se pudo borrar el archivo '%s'\n", fullpath);
         }
     } else {
-        #if defined(HTTPCLIENT_1_2_COMPATIBLE) || ARDUINO
-          Serial.printf("[HTTP] POST FAIL (%d) %s\n", code, HTTPClient::errorToString(code).c_str());
-        #else
-          Serial.printf("[HTTP] POST FAIL (%d)\n", code);
-        #endif
+#if defined(HTTPCLIENT_1_2_COMPATIBLE) || ARDUINO
+        Serial.printf("[HTTP] POST FAIL (%d) %s\n", code, HTTPClient::errorToString(code).c_str());
+#else
+        Serial.printf("[HTTP] POST FAIL (%d)\n", code);
+#endif
+        // === SOLO CUANDO NO SE HACE EL ENVÍO: guardar {t, w} y sellar línea ===
+        if (netTimeReady()) {
+          char line[64];
+          snprintf(line, sizeof(line), "{\"t\":%lu,\"w\":%d}", (unsigned long)ts, wifiCount);
+          sdcard_append_jsonl(line);
+        } else {
+          Serial.println("[HTTP] POST fallido y sin hora real: NO se guarda {t,w}.");
+        }
+        sdcard_newline();
     }
 
     return ok;
@@ -762,8 +764,8 @@ static void wifi_http_task(void *pvParameters) {
   netTimeInit();
 
   http_msg_t m;
-  
-  // Nombres de archivos que usaremos
+
+  // Rutas de archivo
   char live_path[96];
   char sending_path[96];
   snprintf(live_path, sizeof(live_path), "%s/%s.jsonl", MOUNT_POINT, SDCARD_MACLOG_BASENAME);
@@ -779,7 +781,7 @@ static void wifi_http_task(void *pvParameters) {
     if (!nowConnected) (void)connectToWiFi_local(3000);
     nowConnected = (WiFi.status() == WL_CONNECTED);
 
-    // Si NO hay Wi-Fi, guardamos el recuento y sellamos la línea como antes
+    // Si NO hay Wi-Fi, guardamos el recuento y sellamos la línea
     if (!nowConnected) {
       if (netTimeReady()) {
         char line[64];
@@ -794,60 +796,71 @@ static void wifi_http_task(void *pvParameters) {
     }
 
     // --- DESACOPLAMIENTO (snapshot + envío) ---
-    // 1) Pedimos sellar la línea actual (asíncrono)
-    Serial.println("[HTTP] Sincronizando datos pendientes antes del snapshot...");
-    sdcard_newline();
 
-    // 2) Esperamos a que el archivo 'live' esté listo para snapshot
-    if (!wait_file_stable_closed(live_path, /*timeout_ms*/800, /*settle_ms*/120)) {
-      Serial.println("[HTTP] WARNING: snapshot no listo (archivo no estable o sin '}' final). Se pospone.");
-      // No paramos el logger ni renombramos: en la siguiente ronda lo intentamos de nuevo
-      continue;
+    Serial.println("[HTTP] Sincronizando datos pendientes antes del snapshot...");
+    // Sellado síncrono de la línea activa
+    if (!sdcard_newline_sync(1000)) {
+      Serial.println("[HTTP] WARNING: timeout al sincronizar línea actual");
+    }
+    // Pequeña pausa para que el writer procese todo
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    // 1) Verificar que el archivo 'live' está estable y cierra en '}'.
+    //    Si no lo está, esperamos 1s y reintentamos.
+    bool ready = wait_file_stable_closed(live_path, /*timeout_ms*/800, /*settle_ms*/120);
+    if (!ready) {
+      Serial.println("[HTTP] Snapshot no listo: espero 1000ms y reintento...");
+      vTaskDelay(pdMS_TO_TICKS(1000));  // PAUSA solicitada
+      ready = wait_file_stable_closed(live_path, /*timeout_ms*/800, /*settle_ms*/120);
+    }
+    // 2) Si aún no está listo, seguimos igualmente: el saneado descartará el último objeto parcial.
+    if (!ready) {
+      Serial.println("[HTTP] Forzamos snapshot tras la espera: confío en saneado para descartar el último objeto parcial.");
     }
 
     Serial.println("[HTTP] Preparando backlog para envío...");
-    sdjson_logger_stop(); // detenemos el writer para congelar el archivo
+    sdjson_logger_stop(); // detenemos el writer para “congelar” el archivo
 
     // ¿Quedó un archivo pendiente de un intento anterior?
     bool pending_file_exists = false;
     FILE* f_pending = fopen(sending_path, "r");
     if (f_pending) { fclose(f_pending); pending_file_exists = true; }
 
-    // Renombramos el archivo "en vivo" a "_sending" si no hay uno pendiente
+    // Renombramos el archivo “en vivo” a “_sending” si no hay uno pendiente
     bool renamed_ok = false;
     FILE* f_live = fopen(live_path, "r");
     if (f_live) {
-        fclose(f_live);
-        if (!pending_file_exists) {
-            if (rename(live_path, sending_path) == 0) {
-                renamed_ok = true;
-                Serial.printf("[HTTP] Archivo '%s' renombrado a '%s'\n", live_path, sending_path);
-            } else {
-                Serial.println("[HTTP] ERROR: Falló el renombrado del archivo de backlog.");
-            }
+      fclose(f_live);
+      if (!pending_file_exists) {
+        if (rename(live_path, sending_path) == 0) {
+          renamed_ok = true;
+          Serial.printf("[HTTP] Archivo '%s' renombrado a '%s'\n", live_path, sending_path);
         } else {
-            Serial.println("[HTTP] Hay un archivo pendiente de envío anterior, no se renombra el actual.");
+          Serial.println("[HTTP] ERROR: Falló el renombrado del archivo de backlog.");
         }
+      } else {
+        Serial.println("[HTTP] Hay un archivo pendiente de envío anterior, no se renombra el actual.");
+      }
     } else {
-        Serial.println("[HTTP] No hay archivo de backlog 'en vivo' para enviar.");
+      Serial.println("[HTTP] No hay archivo de backlog 'en vivo' para enviar.");
     }
-    
-    // Reiniciamos el writer inmediatamente: se empieza a escribir en un nuevo mac_events.jsonl
+
+    // Reiniciamos el writer inmediatamente
     sdjson_logger_start();
 
     // Intentamos enviar el archivo renombrado (o el pendiente anterior)
     if (renamed_ok || pending_file_exists) {
-        Serial.printf("[HTTP] Intentando POST del archivo '%s'...\n", sending_path);
-        bool post_ok = post_file_and_delete_on_ok(sending_path, m.wifi, m.ts);
-        
-        if (!post_ok) {
-            Serial.println("[HTTP] POST falló. El archivo se conservará para el próximo intento.");
-        }
+      Serial.printf("[HTTP] Intentando POST del archivo '%s'...\n", sending_path);
+      bool post_ok = post_file_and_delete_on_ok(sending_path, m.wifi, m.ts);
+      if (!post_ok) {
+        Serial.println("[HTTP] POST falló. El archivo se conservará para el próximo intento.");
+      }
     }
 
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
+
 
 /* ── TAREA PERIÓDICA: purga cada 6 minutos cuando no hay Internet ───────── */
 

@@ -27,7 +27,7 @@ extern "C" {
 extern bool sdjson_logger_start(void);
 extern void sdjson_logger_stop(void);
 extern "C" bool sdjson_delete_first_lines(size_t n);
-/* Cerrar la línea actual de forma SÍNCRONA antes de postear (NO usado aún) */
+/* Cerrar la línea actual de forma SÍNCRONA antes de postear (NO usado) */
 extern "C" bool sdcard_newline_sync(uint32_t timeout_ms);
 /* Cerrar la línea actual (asíncrono) */
 extern "C" void sdcard_newline(void);
@@ -539,6 +539,84 @@ private:
 
 /* ────────────────────────────────────────────────────────────────────────── */
 
+// Espera a que el archivo 'path' termine en '}' y su tamaño permanezca
+// estable durante 'settle_ms'. Devuelve true si está listo antes del timeout.
+static bool wait_file_stable_closed(const char* path,
+                                    uint32_t timeout_ms = 800,
+                                    uint32_t settle_ms  = 120) {
+  uint32_t start   = millis();
+  long     last_sz = -1;
+  uint32_t last_change = millis();
+
+  for (;;) {
+    // Obtener tamaño actual
+    long cur_sz = -1;
+    FILE* f = fopen(path, "rb");
+    if (f) {
+      fseek(f, 0, SEEK_END);
+      cur_sz = ftell(f);
+      fclose(f);
+    }
+
+    if (cur_sz != last_sz) {
+      last_sz = cur_sz;
+      last_change = millis();
+    }
+
+    // Comprobamos último char no-blanco
+    char tail = last_non_ws_char_in_file(path);
+
+    // Condición de “sellado”: termina en '}' y tamaño estable lo suficiente
+    if (tail == '}' && (millis() - last_change) >= settle_ms && last_sz > 0) {
+      return true;
+    }
+
+    if ((millis() - start) >= timeout_ms) {
+      return false; // timeout
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+// Cuenta objetos JSON top-level en todo el archivo (todas las líneas).
+// Asume que el archivo ya está saneado (objetos completos).
+static size_t count_events_in_file(const char* path) {
+  FILE* f = fopen(path, "rb");
+  if (!f) return 0;
+
+  bool in_string = false, esc = false;
+  int  depth = 0;
+  size_t count = 0;
+  int ch;
+
+  while ((ch = fgetc(f)) != EOF) {
+    if (in_string) {
+      if (esc) { esc = false; }
+      else if (ch == '\\') { esc = true; }
+      else if (ch == '"') { in_string = false; }
+      continue;
+    }
+
+    if (ch == '"') {
+      in_string = true;
+      continue;
+    }
+
+    if (ch == '{') {
+      depth++;
+    } else if (ch == '}') {
+      if (depth > 0) {
+        depth--;
+        if (depth == 0) count++; // cerramos un objeto top-level
+      }
+    }
+  }
+
+  fclose(f);
+  return count;
+}
+
 static void rebooter_task(void *arg) {
   (void)arg;
   // pequeño retardo para que salgan logs por UART/USB
@@ -565,12 +643,13 @@ static void schedule_reboot_nonblocking(const char* reason) {
 /**
  * @brief Envía el contenido de un archivo específico vía POST.
  *        (Con diagnóstico y saneado previo de datos incompletos)
+ *        CORREGIDO: recuento_max = nº de objetos realmente presentes.
  */
-static bool post_file_and_delete_on_ok(const char* fullpath, int wifiCount, time_t ts) {
+static bool post_file_and_delete_on_ok(const char* fullpath, int /*wifiCount*/, time_t ts) {
     NdjsonStats st = {};
     (void)compute_ndjson_stats(fullpath, st);
 
-    // DIAGNÓSTICO DEL SNAPSHOT
+    // DIAGNÓSTICO DEL SNAPSHOT (antes de saneado)
     diag_snapshot_shape(fullpath);
 
     // SANEADO: conservar solo objetos completos y quitar comas/datos incompletos
@@ -597,16 +676,32 @@ static bool post_file_and_delete_on_ok(const char* fullpath, int wifiCount, time
         return true; // nada que enviar, no es error
     }
 
+    // === Conteo real de eventos (objetos top-level) en el snapshot saneado ===
+    size_t eventos_reales = count_events_in_file(fullpath);
+    Serial.printf("[HTTP] eventos reales en snapshot: %u\n", (unsigned)eventos_reales);
+
+    if (eventos_reales == 0) {
+        // Saneado dejó algo raro (p. ej., solo espacios). No enviamos.
+        remove(fullpath);
+        gLastPostOkTick = xTaskGetTickCount();
+        Serial.println("[HTTP] Snapshot sin objetos tras saneado -> no posteo.");
+        return true;
+    }
+
+    // Construimos el JSON contenedor
     char prefix[128];
-    snprintf(prefix, sizeof(prefix), "{\"recuento_max\":%d,\"ts\":%lu,\"events\":[",
-             (wifiCount < 0 ? 0 : wifiCount), (unsigned long)ts);
+    snprintf(prefix, sizeof(prefix), "{\"recuento_max\":%u,\"ts\":%lu,\"events\":[",
+             (unsigned)eventos_reales, (unsigned long)ts);
     const size_t prefix_len = strlen(prefix);
 
     static const char suffix[] = "]}";
     const size_t suffix_len = sizeof(suffix) - 1;
 
-    size_t commas = (st.lines > 0) ? (st.lines - 1) : 0;
-    size_t content_len = prefix_len + st.bytes + commas + suffix_len;
+    // Comas entre líneas (insertadas por el streamer) -> (lines - 1)
+    size_t commas_between_lines = (st.lines > 0) ? (st.lines - 1) : 0;
+
+    // Longitud total que enviaremos por streaming
+    size_t content_len = prefix_len + st.bytes + commas_between_lines + suffix_len;
 
     log_mem("antes POST");
     log_stack_watermark("antes POST");
@@ -699,6 +794,16 @@ static void wifi_http_task(void *pvParameters) {
     }
 
     // --- DESACOPLAMIENTO (snapshot + envío) ---
+    // 1) Pedimos sellar la línea actual (asíncrono)
+    Serial.println("[HTTP] Sincronizando datos pendientes antes del snapshot...");
+    sdcard_newline();
+
+    // 2) Esperamos a que el archivo 'live' esté listo para snapshot
+    if (!wait_file_stable_closed(live_path, /*timeout_ms*/800, /*settle_ms*/120)) {
+      Serial.println("[HTTP] WARNING: snapshot no listo (archivo no estable o sin '}' final). Se pospone.");
+      // No paramos el logger ni renombramos: en la siguiente ronda lo intentamos de nuevo
+      continue;
+    }
 
     Serial.println("[HTTP] Preparando backlog para envío...");
     sdjson_logger_stop(); // detenemos el writer para congelar el archivo

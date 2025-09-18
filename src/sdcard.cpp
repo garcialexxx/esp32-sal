@@ -547,7 +547,7 @@ bool sdcard_init(bool create) {
 #endif
 
   // Sanea backlog NDJSON al arranque ANTES de iniciar el writer
-  sdjson_sanity_check_on_boot();
+  //sdjson_sanity_check_on_boot();
 
   sdjson_logger_start();
   return useSDCard;

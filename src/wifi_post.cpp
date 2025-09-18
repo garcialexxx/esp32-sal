@@ -63,7 +63,7 @@ extern "C" bool netTimeReady(void);
 
 // Tamaño de chunk de streaming (más pequeño = menos pila usada)
 #ifndef STREAM_CHUNK_MAX
-#define STREAM_CHUNK_MAX  256
+#define STREAM_CHUNK_MAX  500
 #endif
 
 #ifndef MOUNT_POINT
@@ -73,9 +73,20 @@ extern "C" bool netTimeReady(void);
 #define SDCARD_MACLOG_BASENAME "mac_events"
 #endif
 
+// ── NUEVO: vaciado por offset (rápido)
+#ifndef MAX_LINES_PER_POST
+#define MAX_LINES_PER_POST 25      // ajustable
+#endif
+#define SENDING_PATH  MOUNT_POINT "/" SDCARD_MACLOG_BASENAME "_sending.jsonl"
+#define INDEX_PATH    MOUNT_POINT "/" SDCARD_MACLOG_BASENAME "_sending.idx"
+#define CHUNK_PATH    MOUNT_POINT "/" SDCARD_MACLOG_BASENAME "_chunk.jsonl"
+#define COMPACT_MIN_BYTES (256UL * 1024UL)      // compactar si cursor > 256KB
+#define COMPACT_FRAC_NUM    1                   // compactar si cursor > 1/2 del archivo
+#define COMPACT_FRAC_DEN    2
+
 typedef struct {
-  int    wifi;   // recuento a reportar; si es -1 => tick sin recuento (no lo usamos)
-  time_t ts;     // timestamp del recuento
+  int    wifi;
+  time_t ts;
 } http_msg_t;
 
 static QueueHandle_t gWifiHttpQueue = nullptr;
@@ -84,15 +95,17 @@ static TaskHandle_t  gPurgeTask     = nullptr;
 
 // --- Watchdog / diagnóstico de POST ---
 static TaskHandle_t  gPostResetTask = nullptr;
-// ticks de FreeRTOS para medir progreso real de POST
-static volatile uint32_t gLastPostOkTick  = 0; // último POST OK completado (o saneado vacío considerado OK)
-static volatile uint32_t gLastPostTryTick = 0; // instante en que entramos en sendRequest()
+static volatile uint32_t gLastPostOkTick  = 0;
+static volatile uint32_t gLastPostTryTick = 0;
 
-// Reboot orquestado (para evitar bloqueos antes del restart)
 static volatile bool gRebootScheduled = false;
 
 /* ── Declaración adelantada ──────────────────────────────────────────────── */
-static bool post_file_and_delete_on_ok(const char* fullpath, int wifiCount, time_t ts);
+struct NdjsonStats { size_t lines=0; size_t bytes=0; };
+static bool compute_ndjson_stats(const char* path, NdjsonStats& st);
+static char last_non_ws_char_in_file(const char* path);
+static bool sanitize_snapshot_inplace(const char* path, size_t* out_kept, size_t* out_dropped);
+class NdjsonArrayStream;
 
 /* ────────────────────────────────────────────────────────────────────────── */
 
@@ -109,7 +122,6 @@ static void log_stack_watermark(const char* tag) {
   Serial.printf("[STACK] %s watermark=%u bytes\n", tag, (unsigned)(hw * sizeof(StackType_t)));
 }
 
-// Conexión con timeout y logs claros (devuelve true si quedó conectado)
 static bool connectToWiFi_local(uint32_t timeoutMs = 15000) {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("[WIFI] Ya conectado. IP: %s\n", WiFi.localIP().toString().c_str());
@@ -117,15 +129,12 @@ static bool connectToWiFi_local(uint32_t timeoutMs = 15000) {
   }
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-
   Serial.println("[WIFI] Conectando a Wi-Fi (HTTP)...");
   uint32_t start = millis(), lastDot = 0;
-
   while (WiFi.status() != WL_CONNECTED && (millis() - start) < timeoutMs) {
     if (millis() - lastDot >= 500) { Serial.print("."); lastDot = millis(); }
     vTaskDelay(pdMS_TO_TICKS(50));
   }
-
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("\n[WIFI] Conectado. IP: %s\n", WiFi.localIP().toString().c_str());
     return true;
@@ -141,123 +150,43 @@ static inline bool have_tls_memory() {
   return (freeHeap >= TLS_MIN_FREE_HEAP) && (largestBlk >= TLS_MIN_LARGEST_BLOCK);
 }
 
-/* ──────────────────────────────────────────────────────────────────────────
-   Calcular tamaño total para Content-Length del streaming.
-   Cada línea del archivo es un "lote" de objetos (separados por comas).
-   ────────────────────────────────────────────────────────────────────────── */
-struct NdjsonStats {
-  size_t lines = 0;  // nº de líneas (lotes)
-  size_t bytes = 0;  // suma de longitudes de líneas, sin CR/LF
-};
+/* ── Stats y diagnóstico básicos ─────────────────────────────────────────── */
 
 static bool compute_ndjson_stats(const char* path, NdjsonStats& st) {
   FILE* f = fopen(path, "r");
-  if (!f) {
-    st.lines = 0;
-    st.bytes = 0;
-    return false;
-  }
-
-  size_t lines = 0, bytes = 0, cur = 0;
-  int c;
+  if (!f) { st.lines = st.bytes = 0; return false; }
+  size_t lines = 0, bytes = 0, cur = 0; int c;
   while ((c = fgetc(f)) != EOF) {
     if (c == '\r') continue;
-    if (c == '\n') {
-      if (cur > 0) { lines++; bytes += cur; cur = 0; }
-    } else {
-      cur++;
-    }
+    if (c == '\n') { if (cur > 0) { lines++; bytes += cur; cur = 0; } }
+    else { cur++; }
   }
   if (cur > 0) { lines++; bytes += cur; }
   fclose(f);
-
-  st.lines = lines;
-  st.bytes = bytes;
-  return true;
+  st.lines = lines; st.bytes = bytes; return true;
 }
 
-/* Utilidades de diagnóstico del snapshot ---------------------------------- */
-
 static char last_non_ws_char_in_file(const char* path) {
-  FILE* f = fopen(path, "rb");
-  if (!f) return '\0';
+  FILE* f = fopen(path, "rb"); if (!f) return '\0';
   if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return '\0'; }
   long pos = ftell(f);
   if (pos <= 0) { fclose(f); return '\0'; }
   int c = 0;
   for (long i = pos - 1; i >= 0; --i) {
-    fseek(f, i, SEEK_SET);
-    c = fgetc(f);
+    fseek(f, i, SEEK_SET); c = fgetc(f);
     if (c == EOF) break;
     if (!isspace(c)) { fclose(f); return (char)c; }
   }
-  fclose(f);
-  return '\0';
+  fclose(f); return '\0';
 }
 
-// Devuelve true si detecta alguna línea no vacía que no termina en '}' (o no empieza en '{')
-static bool find_bad_jsonish_line(const char* path, size_t* out_bad_line, char* out_endchar) {
-  FILE* f = fopen(path, "r");
-  if (!f) return false;
-  char line[1024];
-  size_t lineno = 0;
-  while (fgets(line, sizeof(line), f)) {
-    lineno++;
-    // recortar CR/LF y espacios
-    int len = (int)strlen(line);
-    while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r' || isspace((unsigned char)line[len-1]))) len--;
-    line[len] = '\0';
-    int start = 0;
-    while (line[start] && isspace((unsigned char)line[start])) start++;
-
-    if (len - start <= 0) continue; // línea vacía
-
-    char first = line[start];
-    char last  = line[len-1];
-
-    // Heurística: esperamos objetos JSON por línea -> empiezan con '{' y acaban con '}'
-    if (first != '{' || last != '}') {
-      if (out_bad_line) *out_bad_line = lineno;
-      if (out_endchar)  *out_endchar  = last;
-      fclose(f);
-      return true;
-    }
-  }
-  fclose(f);
-  return false;
-}
-
-static void diag_snapshot_shape(const char* path) {
-  NdjsonStats st = {};
-  (void)compute_ndjson_stats(path, st);
-  char tail = last_non_ws_char_in_file(path);
-  size_t bad_line = 0;
-  char   bad_end  = 0;
-  bool has_bad = find_bad_jsonish_line(path, &bad_line, &bad_end);
-
-  Serial.printf("[DIAG] snapshot '%s': lines=%u bytes=%u tail=0x%02X '%c'%s",
-                path, (unsigned)st.lines, (unsigned)st.bytes,
-                (unsigned char)tail, (tail ? tail : ' '),
-                (has_bad ? " [BAD-LINE]" : " [OK-LINES]"));
-  if (has_bad) {
-    Serial.printf(" bad_line=%u endchar=0x%02X '%c'\n",
-                  (unsigned)bad_line, (unsigned char)bad_end, (bad_end ? bad_end : ' '));
-  } else {
-    Serial.printf("\n");
-  }
-
-  if (tail == ',') {
-    Serial.println("[DIAG] ALERTA: el snapshot termina en coma ',' -> JSON resultante será inválido.");
-  }
-}
-
-/* ── SANEADO: conservar objetos completos, eliminar “datos” incompletos ──── */
+/* ── Saneado (conserva objetos completos) ────────────────────────────────── */
 
 static void sb_append(char** buf, size_t* cap, size_t* len, char c) {
   if (*len + 1 >= *cap) {
     size_t ncap = (*cap == 0) ? 256 : (*cap * 2);
     char* nb = (char*)realloc(*buf, ncap);
-    if (!nb) return; // sin memoria: se truncará silenciosamente
+    if (!nb) return;
     *buf = nb; *cap = ncap;
   }
   (*buf)[(*len)++] = c;
@@ -271,148 +200,85 @@ static bool sanitize_snapshot_inplace(const char* path, size_t* out_kept, size_t
   FILE* fi = fopen(path, "rb");
   if (!fi) return false;
 
-  char tmpPath[128];
-  snprintf(tmpPath, sizeof(tmpPath), "%s.san", path);
-  FILE* fo = fopen(tmpPath, "wb");
-  if (!fo) { fclose(fi); return false; }
+  char tmpPath[128]; snprintf(tmpPath, sizeof(tmpPath), "%s.san", path);
+  FILE* fo = fopen(tmpPath, "wb"); if (!fo) { fclose(fi); return false; }
 
   size_t kept_total = 0, dropped_total = 0;
-
-  bool in_string = false;
-  bool esc = false;
-  int  depth = 0;            // profundidad de llaves { }
-  bool have_obj = false;     // tenemos un objeto en curso (depth>0 desde que vimos '{')
-
-  char* objbuf = nullptr;    // buffer dinámico del objeto en curso
-  size_t obcap = 0, oblen = 0;
-
-  bool wrote_any_in_line = false; // si se escribió algún objeto en la línea actual
+  bool in_string=false, esc=false, have_obj=false; int depth=0;
+  char* objbuf=nullptr; size_t obcap=0, oblen=0; bool wrote_any_in_line=false;
 
   int ch;
   while ((ch = fgetc(fi)) != EOF) {
-    if (ch == '\r') continue; // ignorar CR
-
+    if (ch == '\r') continue;
     if (depth == 0) {
-      // NO dentro de objeto
-      if (ch == '{') {
-        // empezar objeto
-        in_string = false; esc = false; depth = 1; have_obj = true;
-        oblen = 0; // reset buffer
-        sb_append(&objbuf, &obcap, &oblen, '{');
-      } else if (ch == '\n') {
-        // fin de línea: si estábamos a medias de un objeto (no debería), descartar
-        if (have_obj && depth > 0) {
-          dropped_total++; // objeto incompleto
-          have_obj = false; depth = 0; in_string = false; esc = false;
-          oblen = 0;
-        }
-        if (wrote_any_in_line) {
-          fputc('\n', fo);
-          wrote_any_in_line = false;
-        }
-        // si no se escribió nada en la línea, simplemente la omitimos
-      } else {
-        // fuera de objeto: comas sueltas, espacios, basura -> ignorar
-      }
+      if (ch == '{') { in_string=false; esc=false; depth=1; have_obj=true; oblen=0; sb_append(&objbuf,&obcap,&oblen,'{'); }
+      else if (ch == '\n') {
+        if (have_obj && depth > 0) { dropped_total++; have_obj=false; depth=0; in_string=false; esc=false; oblen=0; }
+        if (wrote_any_in_line) { fputc('\n', fo); wrote_any_in_line=false; }
+      } else { /* basura fuera de objeto: ignorar */ }
     } else {
-      // DENTRO de objeto: copiar char, gestionar estado
-      sb_append(&objbuf, &obcap, &oblen, (char)ch);
-
+      sb_append(&objbuf,&obcap,&oblen,(char)ch);
       if (in_string) {
-        if (esc) { esc = false; }
-        else if (ch == '\\') { esc = true; }
-        else if (ch == '"') { in_string = false; }
+        if (esc) esc=false;
+        else if (ch=='\\') esc=true;
+        else if (ch=='"') in_string=false;
       } else {
-        if (ch == '"') {
-          in_string = true;
-        } else if (ch == '{') {
-          depth++;
-        } else if (ch == '}') {
-          depth--;
-          if (depth == 0) {
-            // Objeto completo: escribirlo (con coma si no es el primero de la línea)
+        if (ch=='"') in_string=true;
+        else if (ch=='{') depth++;
+        else if (ch=='}') {
+          if (--depth == 0) {
             if (wrote_any_in_line) fputc(',', fo);
-            if (oblen > 0) fwrite(objbuf, 1, oblen, fo);
-            kept_total++;
-            wrote_any_in_line = true;
-            have_obj = false; oblen = 0;
+            if (oblen>0) fwrite(objbuf,1,oblen,fo);
+            kept_total++; wrote_any_in_line=true; have_obj=false; oblen=0;
           }
         }
       }
     }
   }
+  if (have_obj && depth>0) { dropped_total++; have_obj=false; oblen=0; }
+  if (wrote_any_in_line) fputc('\n', fo);
 
-  // EOF: si quedó objeto a medias, descartar
-  if (have_obj && depth > 0) {
-    dropped_total++;
-    have_obj = false;
-    oblen = 0;
-  }
-  // Cerrar última línea si escribimos algo y no había \n final
-  if (wrote_any_in_line) {
-    fputc('\n', fo);
-  }
-
-  free(objbuf);
-  fclose(fi);
-  fclose(fo);
-
-  if (out_kept)    *out_kept = kept_total;
-  if (out_dropped) *out_dropped = dropped_total;
+  free(objbuf); fclose(fi); fclose(fo);
 
   if (kept_total == 0) {
-    // nada útil -> eliminar saneado y original
-    remove(tmpPath);
-    Serial.printf("[SAN] '%s': kept=0 dropped=%u -> archivo eliminado, no se postea.\n",
-                  path, (unsigned)dropped_total);
-    remove(path);
-    return true; // saneado correcto, pero sin datos
+    remove(tmpPath); remove(path);
+    Serial.printf("[SAN] '%s': kept=0 dropped=%u -> nada útil\n", path, (unsigned)dropped_total);
+    return true;
   }
-
-  // Reemplazar original por saneado
   remove(path);
   if (rename(tmpPath, path) != 0) {
-    Serial.printf("[SAN] '%s': kept=%u dropped=%u -> ERROR al reemplazar snapshot\n",
+    Serial.printf("[SAN] '%s': kept=%u dropped=%u -> ERROR al reemplazar\n",
                   path, (unsigned)kept_total, (unsigned)dropped_total);
-    // best effort: dejamos el .san
     return false;
   }
-
-  Serial.printf("[SAN] '%s': kept=%u dropped=%u -> snapshot saneado OK\n",
+  Serial.printf("[SAN] '%s': kept=%u dropped=%u -> OK\n",
                 path, (unsigned)kept_total, (unsigned)dropped_total);
   return true;
 }
 
-/* Stream que emite: prefix + (linea1 + , + linea2 + ...) + suffix sin cargar todo en RAM */
+/* ── Stream para POST del NDJSON envuelto en JSON ───────────────────────── */
+
 class NdjsonArrayStream : public Stream {
 public:
   NdjsonArrayStream(const char* path,
                     const char* prefix, size_t prefix_len,
                     const char* suffix, size_t suffix_len)
-  : _f(nullptr),
-    _path(path),
+  : _f(nullptr), _path(path),
     _prefix(prefix), _prefix_len(prefix_len), _prefix_pos(0),
     _suffix(suffix), _suffix_len(suffix_len), _suffix_pos(0),
     _state(STATE_PREFIX),
-    _need_comma_between_lines(false),
-    _in_line(false),
-    _line_started(false),
-    _buf_len(0), _buf_pos(0)
-  {}
+    _need_comma_between_lines(false), _in_line(false), _line_started(false),
+    _buf_len(0), _buf_pos(0) {}
 
   bool begin() {
     _f = fopen(_path, "r");
     _buf_len = _buf_pos = 0;
     _need_comma_between_lines = false;
-    _in_line = false;
-    _line_started = false;
+    _in_line = false; _line_started = false;
     _state = STATE_PREFIX;
-    return true; // incluso si _f == nullptr, enviaremos prefix+suffix
+    return true;
   }
-
-  void end() {
-    if (_f) { fclose(_f); _f = nullptr; }
-  }
+  void end() { if (_f) { fclose(_f); _f=nullptr; } }
 
   int available() override {
     if (_buf_pos < _buf_len) return (int)(_buf_len - _buf_pos);
@@ -422,17 +288,12 @@ public:
         size_t remain = _prefix_len - _prefix_pos;
         size_t n = (remain > STREAM_CHUNK_MAX) ? STREAM_CHUNK_MAX : remain;
         memcpy(_buf, _prefix + _prefix_pos, n);
-        _prefix_pos += n;
-        _buf_len = n; _buf_pos = 0;
-        return (int)n;
-      } else {
-        _state = STATE_FILE;
-      }
+        _prefix_pos += n; _buf_len = n; _buf_pos = 0; return (int)n;
+      } else { _state = STATE_FILE; }
     }
 
     if (_state == STATE_FILE) {
-      int n = fill_from_file();
-      if (n > 0) return n;
+      int n = fill_from_file(); if (n > 0) return n;
       _state = STATE_SUFFIX;
     }
 
@@ -441,27 +302,14 @@ public:
         size_t remain = _suffix_len - _suffix_pos;
         size_t n = (remain > STREAM_CHUNK_MAX) ? STREAM_CHUNK_MAX : remain;
         memcpy(_buf, _suffix + _suffix_pos, n);
-        _suffix_pos += n;
-        _buf_len = n; _buf_pos = 0;
-        return (int)n;
-      } else {
-        _state = STATE_DONE;
-      }
+        _suffix_pos += n; _buf_len = n; _buf_pos = 0; return (int)n;
+      } else { _state = STATE_DONE; }
     }
-
     return 0;
   }
 
-  int read() override {
-    if (available() <= 0) return -1;
-    return _buf[_buf_pos++];
-  }
-
-  int peek() override {
-    if (available() <= 0) return -1;
-    return _buf[_buf_pos];
-  }
-
+  int read() override { if (available() <= 0) return -1; return _buf[_buf_pos++]; }
+  int peek() override { if (available() <= 0) return -1; return _buf[_buf_pos]; }
   void flush() override {}
   size_t write(uint8_t) override { return 0; }
 
@@ -470,43 +318,31 @@ private:
 
   int fill_from_file() {
     _buf_len = _buf_pos = 0;
-
-    if (!_f) return 0; // no hay archivo, no hay líneas
-
+    if (!_f) return 0;
     while (_buf_len < (int)sizeof(_buf)) {
       int c = fgetc(_f);
       if (c == EOF) {
-        if (_in_line && _line_started) {
-          _in_line = false;
-          _need_comma_between_lines = true;
-        }
+        if (_in_line && _line_started) { _in_line = false; _need_comma_between_lines = true; }
         break;
       }
       if (c == '\r') continue;
 
       if (!_in_line) {
-        if (c == '\n') continue; // saltar líneas vacías
-        _in_line = true;
-        _line_started = false;
+        if (c == '\n') continue;
+        _in_line = true; _line_started = false;
         if (_need_comma_between_lines) {
           if (_buf_len < (int)sizeof(_buf)) _buf[_buf_len++] = ',';
-          else { ungetc(c, _f); break; }
+          else { ungetc(c,_f); break; }
           _need_comma_between_lines = false;
         }
       }
 
       if (c == '\n') {
-        _in_line = false;
-        _need_comma_between_lines = true;
-        if (_buf_len == 0) continue;
-        else break;
+        _in_line = false; _need_comma_between_lines = true;
+        if (_buf_len == 0) continue; else break;
       } else {
-        if (_buf_len < (int)sizeof(_buf)) {
-          _buf[_buf_len++] = (uint8_t)c;
-          _line_started = true;
-        } else {
-          break;
-        }
+        if (_buf_len < (int)sizeof(_buf)) { _buf[_buf_len++] = (uint8_t)c; _line_started = true; }
+        else break;
       }
     }
     return (int)_buf_len;
@@ -514,358 +350,365 @@ private:
 
   FILE*  _f;
   const char* _path;
-
   const char* _prefix; size_t _prefix_len; size_t _prefix_pos;
   const char* _suffix; size_t _suffix_len; size_t _suffix_pos;
-
   State  _state;
-
-  bool   _need_comma_between_lines;
-  bool   _in_line;
-  bool   _line_started;
-
-  uint8_t _buf[STREAM_CHUNK_MAX];
-  size_t  _buf_len, _buf_pos;
+  bool   _need_comma_between_lines, _in_line, _line_started;
+  uint8_t _buf[STREAM_CHUNK_MAX]; size_t _buf_len, _buf_pos;
 };
 
-/* ────────────────────────────────────────────────────────────────────────── */
+/* ── Utilidades de envío ─────────────────────────────────────────────────── */
 
-// Espera a que el archivo 'path' termine en '}' y su tamaño permanezca
-// estable durante 'settle_ms'. Devuelve true si está listo antes del timeout.
-static bool wait_file_stable_closed(const char* path,
-                                    uint32_t timeout_ms = 800,
-                                    uint32_t settle_ms  = 120) {
-  uint32_t start   = millis();
-  long     last_sz = -1;
-  uint32_t last_change = millis();
+static size_t count_events_in_file(const char* path) {
+  FILE* f = fopen(path, "rb"); if (!f) return 0;
+  bool in_string=false, esc=false; int depth=0; size_t count=0; int ch;
+  while ((ch=fgetc(f))!=EOF) {
+    if (in_string) { if (esc) esc=false; else if (ch=='\\') esc=true; else if (ch=='"') in_string=false; continue; }
+    if (ch=='{') depth++;
+    else if (ch=='}') { if (depth>0 && --depth==0) count++; }
+  }
+  fclose(f); return count;
+}
+
+static void rebooter_task(void *arg) {
+  (void)arg;
+  for (int i=0;i<5;++i) { Serial.println("[WATCHDOG] Reinicio programado..."); vTaskDelay(pdMS_TO_TICKS(200)); }
+  esp_restart();
+}
+
+static void schedule_reboot_nonblocking(const char* reason) {
+  if (gRebootScheduled) return;
+  gRebootScheduled = true;
+  Serial.printf("[WATCHDOG] %s\n", reason ? reason : "Reinicio solicitado");
+  sdcard_newline();
+  xTaskCreatePinnedToCore(rebooter_task, "rebooter", 3072, NULL, configMAX_PRIORITIES-1, NULL, tskNO_AFFINITY);
+}
+
+/* ── NUEVO: manejo por cursor/offset ─────────────────────────────────────── */
+
+// Carga/guarda cursor (offset en bytes) del archivo SENDING_PATH.
+static bool load_cursor(size_t& off) {
+  FILE* f = fopen(INDEX_PATH, "r");
+  if (!f) { off = 0; return true; }
+  unsigned long v=0; int r = fscanf(f, "%lu", &v); fclose(f);
+  if (r==1) { off = (size_t)v; return true; }
+  off = 0; return false;
+}
+static bool save_cursor(size_t off) {
+  FILE* f = fopen(INDEX_PATH, "w");
+  if (!f) return false;
+  fprintf(f, "%lu\n", (unsigned long)off);
+  fclose(f); return true;
+}
+static void reset_cursor() {
+  remove(INDEX_PATH);
+  save_cursor(0);
+}
+
+// Crea chunk desde 'start_offset' leyendo como máx. 'max_lines'.
+// Devuelve líneas y bytes leídos de SENDING_PATH.
+static bool make_chunk_from_offset(const char* src, const char* dst,
+                                   size_t max_lines,
+                                   size_t start_offset,
+                                   size_t* out_lines,
+                                   size_t* out_bytes)
+{
+  if (out_lines) *out_lines = 0;
+  if (out_bytes) *out_bytes = 0;
+
+  FILE* fi = fopen(src, "rb");
+  if (!fi) return false;
+
+  fseek(fi, 0, SEEK_END);
+  long total = ftell(fi);
+  if ((long)start_offset >= total) { fclose(fi); return false; }
+
+  fseek(fi, (long)start_offset, SEEK_SET);
+  FILE* fo = fopen(dst, "wb"); if (!fo) { fclose(fi); return false; }
+
+  size_t lines=0, bytes=0; int ch;
+  while (lines < max_lines && (ch=fgetc(fi)) != EOF) {
+    if (ch == '\r') continue;
+    fputc(ch, fo); bytes++;
+    if (ch == '\n') lines++;
+  }
+  fclose(fo); fclose(fi);
+
+  if (out_lines) *out_lines = lines;
+  if (out_bytes) *out_bytes = bytes;
+
+  if (lines == 0) { remove(dst); return false; }
+  return true;
+}
+
+// Compacta el archivo desde 'offset': copia el resto a un tmp y renombra.
+static bool compact_file_from_offset(const char* path, size_t offset) {
+  FILE* fi = fopen(path, "rb"); if (!fi) return false;
+  if (fseek(fi, (long)offset, SEEK_SET) != 0) { fclose(fi); return false; }
+
+  char tmp[128]; snprintf(tmp, sizeof(tmp), "%s.comp", path);
+  FILE* fo = fopen(tmp, "wb"); if (!fo) { fclose(fi); return false; }
+
+  int ch; while ((ch=fgetc(fi)) != EOF) fputc(ch, fo);
+  fclose(fi); fclose(fo);
+
+  remove(path);
+  if (rename(tmp, path) != 0) { remove(tmp); return false; }
+  return true;
+}
+
+// POST de un chunk NDJSON envuelto
+static int post_chunk(const char* chunk_path, int wifiCount, time_t ts) {
+  NdjsonStats st = {}; (void)compute_ndjson_stats(chunk_path, st);
+  if (st.lines == 0 || st.bytes == 0) return 204;
+
+  char prefix[128];
+  snprintf(prefix, sizeof(prefix),
+           "{\"recuento_max\":%d,\"ts\":%lu,\"events\":[",
+           wifiCount, (unsigned long)ts);
+  const size_t prefix_len = strlen(prefix);
+  static const char suffix[] = "]}";
+  const size_t suffix_len = sizeof(suffix) - 1;
+
+  size_t commas_between_lines = (st.lines > 0) ? (st.lines - 1) : 0;
+  size_t content_len = prefix_len + st.bytes + commas_between_lines + suffix_len;
+
+  if (!have_tls_memory()) { Serial.println("[HTTP] Heap insuficiente TLS (chunk)"); return -1; }
+
+  WiFiClientSecure client; client.setInsecure(); client.setTimeout(8000);
+  HTTPClient http; http.setConnectTimeout(5000); http.setTimeout(12000);
+
+  if (!http.begin(client, POST_URL)) { Serial.println("[HTTP] begin() falló (chunk)"); return -2; }
+  http.addHeader("Content-Type", "application/json");
+
+  NdjsonArrayStream streamer(chunk_path, prefix, prefix_len, suffix, suffix_len);
+  streamer.begin();
+  gLastPostTryTick = xTaskGetTickCount();
+  int code = http.sendRequest("POST", &streamer, content_len);
+  streamer.end(); http.end();
+
+  if (code > 0 && code < 400) {
+    gLastPostOkTick = xTaskGetTickCount();
+    Serial.printf("[HTTP] POST chunk OK (%d)\n", code);
+  } else {
+    #if defined(HTTPCLIENT_1_2_COMPATIBLE) || ARDUINO
+      Serial.printf("[HTTP] POST chunk FAIL (%d) %s\n", code, HTTPClient::errorToString(code).c_str());
+    #else
+      Serial.printf("[HTTP] POST chunk FAIL (%d)\n", code);
+    #endif
+  }
+  return code;
+}
+
+/* ── (Legacy) enviar archivo entero (queda sin usar) ─────────────────────── */
+static bool post_file_and_delete_on_ok(const char* fullpath, int wifiCount, time_t ts) {
+  NdjsonStats st = {}; (void)compute_ndjson_stats(fullpath, st);
+  size_t kept=0, dropped=0;
+  bool saneado_ok = sanitize_snapshot_inplace(fullpath,&kept,&dropped);
+  if (!saneado_ok) return false;
+  if (kept==0) { gLastPostOkTick = xTaskGetTickCount(); return true; }
+
+  (void)compute_ndjson_stats(fullpath, st);
+  if (st.lines==0 || st.bytes==0) { remove(fullpath); gLastPostOkTick = xTaskGetTickCount(); return true; }
+
+  char prefix[128];
+  snprintf(prefix, sizeof(prefix), "{\"recuento_max\":%d,\"ts\":%lu,\"events\":[", wifiCount, (unsigned long)ts);
+  const size_t prefix_len = strlen(prefix);
+  static const char suffix[] = "]}";
+  const size_t suffix_len = sizeof(suffix) - 1;
+
+  size_t commas_between_lines = (st.lines>0) ? (st.lines-1) : 0;
+  size_t content_len = prefix_len + st.bytes + commas_between_lines + suffix_len;
+
+  if (!have_tls_memory()) return false;
+
+  WiFiClientSecure client; client.setInsecure(); client.setTimeout(8000);
+  HTTPClient http; http.setConnectTimeout(5000); http.setTimeout(12000);
+  if (!http.begin(client, POST_URL)) return false;
+  http.addHeader("Content-Type", "application/json");
+
+  NdjsonArrayStream streamer(fullpath, prefix, prefix_len, suffix, suffix_len);
+  streamer.begin();
+  gLastPostTryTick = xTaskGetTickCount();
+  int code = http.sendRequest("POST", &streamer, content_len);
+  streamer.end(); http.end();
+
+  bool ok = (code>0 && code<400);
+  if (ok) { gLastPostOkTick = xTaskGetTickCount(); remove(fullpath); }
+  return ok;
+}
+
+/* ── Task principal ──────────────────────────────────────────────────────── */
+
+static void wifi_http_task(void *pvParameters) {
+  (void) pvParameters;
+
+  (void)connectToWiFi_local();
+  netTimeInit();
+
+  http_msg_t m;
+
+  char live_path[96];
+  snprintf(live_path, sizeof(live_path), "%s/%s.jsonl", MOUNT_POINT, SDCARD_MACLOG_BASENAME);
 
   for (;;) {
-    // Obtener tamaño actual
-    long cur_sz = -1;
-    FILE* f = fopen(path, "rb");
-    if (f) {
-      fseek(f, 0, SEEK_END);
-      cur_sz = ftell(f);
-      fclose(f);
+    if (gRebootScheduled) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
+
+    if (xQueueReceive(gWifiHttpQueue, &m, portMAX_DELAY) != pdTRUE) continue;
+
+    if (netTimeReady()) {
+      char line[64];
+      snprintf(line, sizeof(line), "{\"t\":%lu,\"w\":%d}", (unsigned long)m.ts, m.wifi);
+      sdcard_append_jsonl(line);
+    } else {
+      Serial.println("[HTTP] Sin hora real: NO se guarda {t,w}.");
+    }
+    sdcard_newline();
+    Serial.printf("[HTTP] Lote sellado en SD con ts=%lu\n", (unsigned long)m.ts);
+
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("[HTTP] Sin Wi-Fi, el lote queda pendiente.");
+      continue;
     }
 
-    if (cur_sz != last_sz) {
-      last_sz = cur_sz;
-      last_change = millis();
+    vTaskDelay(pdMS_TO_TICKS(150));
+
+    // Congelar y mover live->sending si no hay pendiente
+    sdjson_logger_stop();
+
+    bool pending_exists = false;
+    { FILE* f = fopen(SENDING_PATH, "r"); if (f) { fclose(f); pending_exists = true; } }
+
+    bool renamed_ok = false;
+    {
+      FILE* f_live = fopen(live_path, "r");
+      if (f_live) {
+        fclose(f_live);
+        if (!pending_exists) {
+          if (rename(live_path, SENDING_PATH) == 0) {
+            renamed_ok = true;
+            reset_cursor(); // empezamos en offset 0
+            Serial.printf("[HTTP] Snapshot: '%s' -> '%s'\n", live_path, SENDING_PATH);
+          } else {
+            Serial.println("[HTTP] ERROR: Falló el renombrado del backlog.");
+          }
+        } else {
+          Serial.println("[HTTP] Hay un archivo de cola pendiente; se prioriza ese.");
+        }
+      } else {
+        Serial.println("[HTTP] No hay backlog 'en vivo' para enviar.");
+      }
     }
+    sdjson_logger_start();
 
-    // Comprobamos último char no-blanco
-    char tail = last_non_ws_char_in_file(path);
+    // Vaciar por chunks usando offset
+    if (renamed_ok || pending_exists) {
+      size_t cursor=0; (void)load_cursor(cursor);
 
-    // Condición de “sellado”: termina en '}' y tamaño estable lo suficiente
-    if (tail == '}' && (millis() - last_change) >= settle_ms && last_sz > 0) {
-      return true;
-    }
+      for (;;) {
+        if (WiFi.status() != WL_CONNECTED) break;
 
-    if ((millis() - start) >= timeout_ms) {
-      return false; // timeout
+        // Si el cursor ya está al final, limpiar y salir
+        FILE* fsz = fopen(SENDING_PATH, "rb");
+        if (!fsz) { remove(INDEX_PATH); break; }
+        fseek(fsz, 0, SEEK_END);
+        long filesize = ftell(fsz);
+        fclose(fsz);
+
+        if ((long)cursor >= filesize) {
+          remove(SENDING_PATH); remove(INDEX_PATH);
+          Serial.println("[HTTP] Cola vacía -> archivo eliminado.");
+          break;
+        }
+
+        // Crear chunk desde cursor
+        size_t lines_read=0, bytes_read=0;
+        if (!make_chunk_from_offset(SENDING_PATH, CHUNK_PATH, MAX_LINES_PER_POST, cursor, &lines_read, &bytes_read)) {
+          // Nada que leer ahora (posibles líneas vacías finales); pasamos a limpiar si procede
+          if ((long)cursor >= filesize) {
+            remove(SENDING_PATH); remove(INDEX_PATH);
+            Serial.println("[HTTP] Cola vacía (EOF).");
+          }
+          break;
+        }
+
+        // Saneado rápido del chunk
+        size_t kept=0, dropped=0;
+        if (!sanitize_snapshot_inplace(CHUNK_PATH, &kept, &dropped)) {
+          Serial.println("[SAN] ERROR saneando chunk; se avanza igualmente para evitar bloqueo.");
+          // Avanzamos offset igualmente
+          cursor += bytes_read; save_cursor(cursor);
+          remove(CHUNK_PATH);
+          continue;
+        }
+
+        // Si quedó vacío tras saneado, avanzar y seguir
+        NdjsonStats cst={}; (void)compute_ndjson_stats(CHUNK_PATH, cst);
+        if (cst.lines == 0 || cst.bytes == 0) {
+          cursor += bytes_read; save_cursor(cursor);
+          remove(CHUNK_PATH);
+          continue;
+        }
+
+        // POST del chunk
+        int code = post_chunk(CHUNK_PATH, m.wifi, m.ts);
+        remove(CHUNK_PATH);
+
+        // Avanzamos SIEMPRE (OK o FAIL), como acordado
+        cursor += bytes_read;
+        save_cursor(cursor);
+
+        // Compactación ocasional para no dejar crecer el offset indefinidamente
+        if (cursor > COMPACT_MIN_BYTES && (cursor * COMPACT_FRAC_DEN) > ((size_t)filesize * COMPACT_FRAC_NUM)) {
+          Serial.printf("[HTTP] Compactando cola: cursor=%lu filesize=%ld\n", (unsigned long)cursor, filesize);
+          if (compact_file_from_offset(SENDING_PATH, cursor)) {
+            cursor = 0; save_cursor(cursor);
+          } else {
+            Serial.println("[HTTP] WARNING: compactación fallida; se reintentará más tarde.");
+          }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10)); // ceder CPU
+      }
     }
 
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
 
-// Cuenta objetos JSON top-level en todo el archivo (todas las líneas).
-// Asume que el archivo ya está saneado (objetos completos).
-static size_t count_events_in_file(const char* path) {
-  FILE* f = fopen(path, "rb");
-  if (!f) return 0;
-
-  bool in_string = false, esc = false;
-  int  depth = 0;
-  size_t count = 0;
-  int ch;
-
-  while ((ch = fgetc(f)) != EOF) {
-    if (in_string) {
-      if (esc) { esc = false; }
-      else if (ch == '\\') { esc = true; }
-      else if (ch == '"') { in_string = false; }
-      continue;
-    }
-
-    if (ch == '{') {
-      depth++;
-    } else if (ch == '}') {
-      if (depth > 0) {
-        depth--;
-        if (depth == 0) count++; // cerramos un objeto top-level
-      }
-    }
-  }
-
-  fclose(f);
-  return count;
-}
-
-static void rebooter_task(void *arg) {
-  (void)arg;
-  // pequeño retardo para que salgan logs por UART/USB
-  for (int i=0; i<5; ++i) {
-    Serial.println("[WATCHDOG] Reinicio programado...");
-    vTaskDelay(pdMS_TO_TICKS(200));
-  }
-  esp_restart(); // no retorna
-  vTaskDelete(NULL);
-}
-
-static void schedule_reboot_nonblocking(const char* reason) {
-  if (gRebootScheduled) return;
-  gRebootScheduled = true;
-
-  Serial.printf("[WATCHDOG] %s\n", reason ? reason : "Reinicio solicitado");
-  // Evitar operaciones bloqueantes aquí. Solo un sellado asíncrono (no bloquea).
-  sdcard_newline();
-
-  // Alta prioridad, cualquier core
-  xTaskCreatePinnedToCore(rebooter_task, "rebooter", 3072, NULL, configMAX_PRIORITIES - 1, NULL, tskNO_AFFINITY);
-}
-
-/**
- * @brief Envía el contenido de un archivo específico vía POST.
- *        (Con diagnóstico y saneado previo de datos incompletos)
- *        CORREGIDO: recuento_max = contador actual (momento del envío).
- */
-static bool post_file_and_delete_on_ok(const char* fullpath, int wifiCount, time_t ts) {
-    NdjsonStats st = {};
-    (void)compute_ndjson_stats(fullpath, st);
-
-    // DIAGNÓSTICO DEL SNAPSHOT (antes de saneado)
-    diag_snapshot_shape(fullpath);
-
-    // SANEADO: conservar solo objetos completos y quitar comas/datos incompletos
-    size_t kept = 0, dropped = 0;
-    bool saneado_ok = sanitize_snapshot_inplace(fullpath, &kept, &dropped);
-    if (!saneado_ok) {
-        Serial.println("[SAN] ERROR de saneado (se intentará más tarde).");
-        return false;
-    }
-    if (kept == 0) {
-        // Consideramos que hubo “progreso” (no hay nada que enviar)
-        gLastPostOkTick = xTaskGetTickCount();
-        Serial.println("[HTTP] Tras saneado no queda nada -> no posteo.");
-        return true; // no es error
-    }
-
-    // Recalcular stats tras saneado
-    (void)compute_ndjson_stats(fullpath, st);
-
-    if (st.lines == 0 || st.bytes == 0) {
-        Serial.printf("[HTTP] Snapshot vacío ('%s'), borrando...\n", fullpath);
-        remove(fullpath);
-        gLastPostOkTick = xTaskGetTickCount();
-        return true; // nada que enviar, no es error
-    }
-
-    // Conteo real de eventos en el snapshot saneado (diagnóstico)
-    size_t eventos_reales = count_events_in_file(fullpath);
-    Serial.printf("[HTTP] eventos reales en snapshot: %u\n", (unsigned)eventos_reales);
-
-    // Construimos el JSON contenedor con recuento_max = contador del momento del envío
-    char prefix[128];
-    snprintf(prefix, sizeof(prefix), "{\"recuento_max\":%d,\"ts\":%lu,\"events\":[",
-             wifiCount, (unsigned long)ts);
-    const size_t prefix_len = strlen(prefix);
-
-    static const char suffix[] = "]}";
-    const size_t suffix_len = sizeof(suffix) - 1;
-
-    size_t commas_between_lines = (st.lines > 0) ? (st.lines - 1) : 0;
-    size_t content_len = prefix_len + st.bytes + commas_between_lines + suffix_len;
-
-    log_mem("antes POST");
-    log_stack_watermark("antes POST");
-
-    if (!have_tls_memory()) {
-        Serial.println("[HTTP] Heap insuficiente para TLS -> se reintentará más tarde.");
-        return false;
-    }
-
-    WiFiClientSecure client;
-    client.setInsecure();
-    client.setTimeout(8000);
-
-    HTTPClient http;
-    http.setConnectTimeout(5000);
-    http.setTimeout(12000);
-
-    if (!http.begin(client, POST_URL)) {
-        Serial.println("[HTTP] begin() falló");
-        return false;
-    }
-    http.addHeader("Content-Type", "application/json");
-
-    NdjsonArrayStream streamer(fullpath, prefix, prefix_len, suffix, suffix_len);
-    streamer.begin();
-
-    gLastPostTryTick = xTaskGetTickCount();
-    int code = http.sendRequest("POST", &streamer, content_len);
-    streamer.end();
-
-    http.end();
-    log_mem("despues POST");
-    log_stack_watermark("despues POST");
-
-    bool ok = (code > 0 && code < 400);
-    if (ok) {
-        gLastPostOkTick = xTaskGetTickCount();
-        Serial.printf("[HTTP] POST OK (%d), borrando '%s'\n", code, fullpath);
-        if (remove(fullpath) != 0) {
-            Serial.printf("[HTTP] WARNING: no se pudo borrar el archivo '%s'\n", fullpath);
-        }
-    } else {
-        #if defined(HTTPCLIENT_1_2_COMPATIBLE) || ARDUINO
-            Serial.printf("[HTTP] POST FAIL (%d) %s\n", code, HTTPClient::errorToString(code).c_str());
-        #else
-            Serial.printf("[HTTP] POST FAIL (%d)\n", code);
-        #endif
-    }
-
-    return ok;
-}
-
-static void wifi_http_task(void *pvParameters) {
-    (void) pvParameters;
-
-    (void)connectToWiFi_local();
-    netTimeInit();
-
-    http_msg_t m;
-
-    // Rutas de archivo que se usarán repetidamente
-    char live_path[96];
-    char sending_path[96];
-    snprintf(live_path, sizeof(live_path), "%s/%s.jsonl", MOUNT_POINT, SDCARD_MACLOG_BASENAME);
-    snprintf(sending_path, sizeof(sending_path), "%s/%s_sending.jsonl", MOUNT_POINT, SDCARD_MACLOG_BASENAME);
-
-    for (;;) {
-        if (gRebootScheduled) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
-
-        // 1. Esperar un nuevo ciclo de recuento
-        if (xQueueReceive(gWifiHttpQueue, &m, portMAX_DELAY) != pdTRUE) {
-            continue;
-        }
-
-        // 2. LÓGICA UNIFICADA Y ASÍNCRONA: Crear y sellar el lote SIEMPRE
-        // Cada ciclo de recuento genera una nueva línea en la SD, sin importar el estado de la red.
-        if (netTimeReady()) {
-            char line[64];
-            snprintf(line, sizeof(line), "{\"t\":%lu,\"w\":%d}", (unsigned long)m.ts, m.wifi);
-            sdcard_append_jsonl(line);
-            sdcard_newline(); // Orden asíncrona de cerrar la línea
-            Serial.printf("[HTTP] Lote sellado en SD con ts=%lu\n", (unsigned long)m.ts);
-        } else {
-            Serial.println("[HTTP] Sin hora real: NO se guarda el resumen del lote en SD.");
-            // Aunque no guardemos el resumen {t,w}, sí cerramos la línea de MACs
-            // para que no se mezclen con el siguiente lote.
-            sdcard_newline();
-        }
-
-        // 3. PARTE CONDICIONAL: Intentar enviar si hay conexión
-        if (WiFi.status() != WL_CONNECTED) {
-             // Si no hay Wi-Fi, el trabajo de este ciclo (guardar en SD) ya está hecho.
-            Serial.println("[HTTP] Sin Wi-Fi, el lote sellado queda pendiente.");
-            continue;
-        }
-
-        // --- HAY WI-FI: PROCEDEMOS A INTENTAR ENVIAR EL BACKLOG ---
-        
-        // Pequeña pausa opcional para dar tiempo al writer de la SD a procesar la nueva línea
-        vTaskDelay(pdMS_TO_TICKS(150));
-
-        // Detenemos el writer para "congelar" el archivo de forma segura antes de manipularlo
-        sdjson_logger_stop();
-
-        // Comprobamos si quedó un archivo pendiente de un intento anterior fallido
-        bool pending_file_exists = false;
-        FILE* f_pending = fopen(sending_path, "r");
-        if (f_pending) {
-            fclose(f_pending);
-            pending_file_exists = true;
-        }
-
-        // Renombramos el archivo "en vivo" a "_sending" solo si no hay uno pendiente ya
-        bool renamed_ok = false;
-        FILE* f_live = fopen(live_path, "r");
-        if (f_live) {
-            fclose(f_live);
-            if (!pending_file_exists) {
-                if (rename(live_path, sending_path) == 0) {
-                    renamed_ok = true;
-                    Serial.printf("[HTTP] Snapshot creado: '%s' -> '%s'\n", live_path, sending_path);
-                } else {
-                    Serial.println("[HTTP] ERROR: Falló el renombrado del archivo de backlog.");
-                }
-            } else {
-                Serial.println("[HTTP] Hay un archivo pendiente de envío anterior, se priorizará ese.");
-            }
-        } else {
-            Serial.println("[HTTP] No hay archivo de backlog 'en vivo' para enviar.");
-        }
-
-        // Reiniciamos el writer inmediatamente para que pueda seguir guardando el siguiente lote
-        sdjson_logger_start();
-
-        // Intentamos enviar el archivo renombrado (o el que ya estaba pendiente)
-        if (renamed_ok || pending_file_exists) {
-            Serial.printf("[HTTP] Intentando POST del archivo '%s'...\n", sending_path);
-            bool post_ok = post_file_and_delete_on_ok(sending_path, m.wifi, m.ts);
-            if (!post_ok) {
-                Serial.println("[HTTP] POST falló. El archivo se conservará para el próximo intento.");
-            }
-        }
-    }
-}
-
-
-/* ── TAREA PERIÓDICA: purga cada 6 minutos cuando no hay Internet ───────── */
+/* ── Purga cada 6 minutos si no hay Internet ─────────────────────────────── */
 
 static void backlog_purge_task(void *pvParameters) {
   (void)pvParameters;
-  const uint32_t kIntervalMs = 6 * 60 * 1000; // 6 minutos
-  const uint32_t kMaxAgeSecs = 48 * 60 * 60;  // 48h
-
+  const uint32_t kIntervalMs = 6 * 60 * 1000;
+  const uint32_t kMaxAgeSecs = 48 * 60 * 60;
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(kIntervalMs));
-
     if (WiFi.status() != WL_CONNECTED) {
       Serial.println("[PURGE] Offline: solicitando purga de líneas > 48h...");
-      // Lo hace la tarea writer, sin carreras
       sdjson_request_purge_older_than(kMaxAgeSecs);
     }
   }
 }
 
-/* ── WATCHDOG: reiniciar si hay Wi-Fi pero 10 min sin progreso de POST ──── */
+/* ── Watchdog de POST ───────────────────────────────────────────────────── */
 
 static void post_reset_watchdog_task(void *pvParameters) {
   (void)pvParameters;
-  const uint32_t kCheckPeriodMs = 60000;         // comprobación cada 1 min
-  const uint32_t kNoPostLimitMs = 10 * 60 * 1000; // 10 minutos
+  const uint32_t kCheckPeriodMs = 60000;
+  const uint32_t kNoPostLimitMs = 10 * 60 * 1000;
 
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(kCheckPeriodMs));
-
     if (gRebootScheduled) continue;
+    if (WiFi.status() != WL_CONNECTED) continue;
 
-    const wl_status_t st = WiFi.status();
-    if (st != WL_CONNECTED) {
-      continue;
-    }
-
-    // Diagnóstico simplificado
     UBaseType_t qdepth = gWifiHttpQueue ? uxQueueMessagesWaiting(gWifiHttpQueue) : 0;
-
     uint32_t nowTick  = xTaskGetTickCount();
     uint32_t lastTry  = gLastPostTryTick;
     uint32_t lastOk   = gLastPostOkTick;
-    uint32_t sinceTryMs = (lastTry > 0 && nowTick > lastTry) ? (nowTick - lastTry) * portTICK_PERIOD_MS : 0;
-    uint32_t sinceOkMs  = (lastOk > 0 && nowTick > lastOk)  ? (nowTick - lastOk)  * portTICK_PERIOD_MS : 0;
+    uint32_t sinceTryMs = (lastTry>0 && nowTick>lastTry) ? (nowTick-lastTry)*portTICK_PERIOD_MS : 0;
+    uint32_t sinceOkMs  = (lastOk>0 && nowTick>lastOk)   ? (nowTick-lastOk)*portTICK_PERIOD_MS  : 0;
 
     Serial.printf("[WATCHDOG] diag: qdepth=%u, sinceTry=%ums, sinceOk=%ums\n",
                   (unsigned)qdepth, (unsigned)sinceTryMs, (unsigned)sinceOkMs);
@@ -874,39 +717,27 @@ static void post_reset_watchdog_task(void *pvParameters) {
     if (lastActivityTick == 0) continue;
 
     uint32_t elapsedMs = (nowTick - lastActivityTick) * portTICK_PERIOD_MS;
-    if (nowTick < lastActivityTick) { // wrap de ticks
-        elapsedMs = ((0xFFFFFFFFu - lastActivityTick) + nowTick) * portTICK_PERIOD_MS;
-    }
+    if (nowTick < lastActivityTick) elapsedMs = ((0xFFFFFFFFu - lastActivityTick) + nowTick) * portTICK_PERIOD_MS;
 
     if (elapsedMs >= kNoPostLimitMs) {
-      if (lastTry > lastOk) {
-        schedule_reboot_nonblocking("Posible cuelgue en sendRequest(): 10 min sin finalizar intento");
-      } else {
-        // reinicia solo si hay algo pendiente
-        char sending_path[96];
-        snprintf(sending_path, sizeof(sending_path), "%s/%s_sending.jsonl", MOUNT_POINT, SDCARD_MACLOG_BASENAME);
-        FILE* f = fopen(sending_path, "r");
-        bool has_pending_file = (f != NULL);
-        if (f) fclose(f);
-
-        if (qdepth > 0 || has_pending_file) {
-            schedule_reboot_nonblocking("10 min sin POST OK con Wi-Fi y datos pendientes");
-        } else {
-            Serial.println("[WATCHDOG] 10 min sin POST OK y sin datos pendientes. No se reinicia.");
-        }
+      // Si hay backlog o intentos colgados, reiniciamos
+      FILE* f = fopen(SENDING_PATH, "r");
+      bool has_pending_file = (f != NULL);
+      if (f) fclose(f);
+      if (lastTry > lastOk || qdepth > 0 || has_pending_file) {
+        schedule_reboot_nonblocking("10 min sin POST OK con Wi-Fi y datos pendientes");
       }
     }
   }
 }
 
-/* ────────────────────────────────────────────────────────────────────────── */
+/* ── Init / API ─────────────────────────────────────────────────────────── */
 
 void wifi_post_init(void) {
-  // Libera RAM del stack BT si no se usa
   esp_bt_controller_mem_release(ESP_BT_MODE_BTDM);
 
   if (!gWifiHttpQueue)
-    gWifiHttpQueue = xQueueCreate(8, sizeof(http_msg_t));
+    gWifiHttpQueue = xQueueCreate(20, sizeof(http_msg_t));
   if (!gWifiHttpTask) {
     xTaskCreatePinnedToCore(
       wifi_http_task, "wifi_http_task", 12288, NULL, 1, &gWifiHttpTask, 1
@@ -921,7 +752,6 @@ void wifi_post_init(void) {
     uint32_t nowTick = xTaskGetTickCount();
     gLastPostTryTick = nowTick;
     gLastPostOkTick  = nowTick;
-
     xTaskCreatePinnedToCore(
       post_reset_watchdog_task, "post_reset_wd", 4096, NULL, 1, &gPostResetTask, 1
     );

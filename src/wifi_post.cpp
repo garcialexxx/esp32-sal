@@ -31,7 +31,7 @@ extern "C" bool sdjson_delete_first_lines(size_t n);
 extern "C" bool sdcard_newline_sync(uint32_t timeout_ms);
 /* Cerrar la línea actual (asíncrono) */
 extern "C" void sdcard_newline(void);
-/* APPEND para {t,w} cuando no hay Wi-Fi */
+/* APPEND de objetos crudos NDJSON */
 extern "C" void sdcard_append_jsonl(const char *chunk);
 /* Solicitar purga de líneas antiguas al writer (seguro y sin carreras) */
 extern "C" void sdjson_request_purge_older_than(uint32_t max_age_sec);
@@ -49,8 +49,8 @@ extern "C" bool netTimeReady(void);
 
 #ifndef POST_URL
 //#define POST_URL "https://plataforma.phebus.net:443/api/v1/YQARkOKOcKThFSGIAWar/telemetry"
-//#define POST_URL "https://plataforma.phebus.net:443/api/v1/Pl08nZ92k1eYZhXxj9ca/telemetry"
-#define POST_URL "https://plataforma.phebus.net:443/api/v1/4b4Fm1WfHCIEf8kFQPxU/telemetry"
+#define POST_URL "https://plataforma.phebus.net:443/api/v1/Pl08nZ92k1eYZhXxj9ca/telemetry"
+//#define POST_URL "https://plataforma.phebus.net:443/api/v1/4b4Fm1WfHCIEf8kFQPxU/telemetry"
 #endif
 
 // Umbrales de memoria para intentar TLS
@@ -251,14 +251,7 @@ static void diag_snapshot_shape(const char* path) {
   }
 }
 
-/* ── SANEADO: conservar objetos completos, eliminar “datos” incompletos ────
-   Estrategia por línea:
-   - Escanear carácter a carácter.
-   - Detectar objetos top-level { ... } respetando strings y escapes.
-   - Escribir solo los objetos completos separados por coma (SIN coma final).
-   - Ignorar comas y espacios fuera de objetos; descartar el objeto si la línea
-     termina con el objeto a medias (profundidad > 0).
-*/
+/* ── SANEADO: conservar objetos completos, eliminar “datos” incompletos ──── */
 
 static void sb_append(char** buf, size_t* cap, size_t* len, char c) {
   if (*len + 1 >= *cap) {
@@ -345,10 +338,7 @@ static bool sanitize_snapshot_inplace(const char* path, size_t* out_kept, size_t
             have_obj = false; oblen = 0;
           }
         }
-        // los corchetes [] no afectan al cierre del objeto top-level
       }
-
-      // Si llega un \n mientras depth>0, lo tratamos en la rama superior al leerlo.
     }
   }
 
@@ -599,11 +589,6 @@ static size_t count_events_in_file(const char* path) {
       continue;
     }
 
-    if (ch == '"') {
-      in_string = true;
-      continue;
-    }
-
     if (ch == '{') {
       depth++;
     } else if (ch == '}') {
@@ -677,7 +662,7 @@ static bool post_file_and_delete_on_ok(const char* fullpath, int wifiCount, time
         return true; // nada que enviar, no es error
     }
 
-    // (Opcional) Conteo real de eventos en el snapshot saneado (diagnóstico)
+    // Conteo real de eventos en el snapshot saneado (diagnóstico)
     size_t eventos_reales = count_events_in_file(fullpath);
     Serial.printf("[HTTP] eventos reales en snapshot: %u\n", (unsigned)eventos_reales);
 
@@ -690,10 +675,7 @@ static bool post_file_and_delete_on_ok(const char* fullpath, int wifiCount, time
     static const char suffix[] = "]}";
     const size_t suffix_len = sizeof(suffix) - 1;
 
-    // Comas entre líneas (insertadas por el streamer) -> (lines - 1)
     size_t commas_between_lines = (st.lines > 0) ? (st.lines - 1) : 0;
-
-    // Longitud total que enviaremos por streaming
     size_t content_len = prefix_len + st.bytes + commas_between_lines + suffix_len;
 
     log_mem("antes POST");
@@ -706,11 +688,11 @@ static bool post_file_and_delete_on_ok(const char* fullpath, int wifiCount, time
 
     WiFiClientSecure client;
     client.setInsecure();
-    client.setTimeout(8000);         // socket RX/TX timeout
+    client.setTimeout(8000);
 
     HTTPClient http;
-    http.setConnectTimeout(5000);    // timeout de conexión TCP
-    http.setTimeout(12000);          // timeout de lectura/cabeceras
+    http.setConnectTimeout(5000);
+    http.setTimeout(12000);
 
     if (!http.begin(client, POST_URL)) {
         Serial.println("[HTTP] begin() falló");
@@ -737,128 +719,107 @@ static bool post_file_and_delete_on_ok(const char* fullpath, int wifiCount, time
             Serial.printf("[HTTP] WARNING: no se pudo borrar el archivo '%s'\n", fullpath);
         }
     } else {
-#if defined(HTTPCLIENT_1_2_COMPATIBLE) || ARDUINO
-        Serial.printf("[HTTP] POST FAIL (%d) %s\n", code, HTTPClient::errorToString(code).c_str());
-#else
-        Serial.printf("[HTTP] POST FAIL (%d)\n", code);
-#endif
-        // === SOLO CUANDO NO SE HACE EL ENVÍO: guardar {t, w} y sellar línea ===
-        if (netTimeReady()) {
-          char line[64];
-          snprintf(line, sizeof(line), "{\"t\":%lu,\"w\":%d}", (unsigned long)ts, wifiCount);
-          sdcard_append_jsonl(line);
-        } else {
-          Serial.println("[HTTP] POST fallido y sin hora real: NO se guarda {t,w}.");
-        }
-        sdcard_newline();
+        #if defined(HTTPCLIENT_1_2_COMPATIBLE) || ARDUINO
+            Serial.printf("[HTTP] POST FAIL (%d) %s\n", code, HTTPClient::errorToString(code).c_str());
+        #else
+            Serial.printf("[HTTP] POST FAIL (%d)\n", code);
+        #endif
     }
 
     return ok;
 }
 
-
 static void wifi_http_task(void *pvParameters) {
-  (void) pvParameters;
+    (void) pvParameters;
 
-  (void)connectToWiFi_local();
-  netTimeInit();
+    (void)connectToWiFi_local();
+    netTimeInit();
 
-  http_msg_t m;
+    http_msg_t m;
 
-  // Rutas de archivo
-  char live_path[96];
-  char sending_path[96];
-  snprintf(live_path, sizeof(live_path), "%s/%s.jsonl", MOUNT_POINT, SDCARD_MACLOG_BASENAME);
-  snprintf(sending_path, sizeof(sending_path), "%s/%s_sending.jsonl", MOUNT_POINT, SDCARD_MACLOG_BASENAME);
+    // Rutas de archivo que se usarán repetidamente
+    char live_path[96];
+    char sending_path[96];
+    snprintf(live_path, sizeof(live_path), "%s/%s.jsonl", MOUNT_POINT, SDCARD_MACLOG_BASENAME);
+    snprintf(sending_path, sizeof(sending_path), "%s/%s_sending.jsonl", MOUNT_POINT, SDCARD_MACLOG_BASENAME);
 
-  for (;;) {
-    if (gRebootScheduled) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
+    for (;;) {
+        if (gRebootScheduled) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
 
-    if (xQueueReceive(gWifiHttpQueue, &m, portMAX_DELAY) != pdTRUE)
-      continue;
-
-    bool nowConnected = (WiFi.status() == WL_CONNECTED);
-    if (!nowConnected) (void)connectToWiFi_local(3000);
-    nowConnected = (WiFi.status() == WL_CONNECTED);
-
-    // Si NO hay Wi-Fi, guardamos el recuento y sellamos la línea
-    if (!nowConnected) {
-      if (netTimeReady()) {
-        char line[64];
-        snprintf(line, sizeof(line), "{\"t\":%lu,\"w\":%d}", (unsigned long)m.ts, m.wifi);
-        sdcard_append_jsonl(line);
-      } else {
-        Serial.println("[HTTP] Sin Wi-Fi y sin hora real: NO se guarda en SD.");
-      }
-      sdcard_newline();
-      Serial.println("[HTTP] Sin Wi-Fi: lote sellado (equivalente a intento de POST).");
-      continue;
-    }
-
-    // --- DESACOPLAMIENTO (snapshot + envío) ---
-
-    Serial.println("[HTTP] Sincronizando datos pendientes antes del snapshot...");
-    // Sellado síncrono de la línea activa
-    if (!sdcard_newline_sync(1000)) {
-      Serial.println("[HTTP] WARNING: timeout al sincronizar línea actual");
-    }
-    // Pequeña pausa para que el writer procese todo
-    vTaskDelay(pdMS_TO_TICKS(100));
-
-    // 1) Verificar que el archivo 'live' está estable y cierra en '}'.
-    //    Si no lo está, esperamos 1s y reintentamos.
-    bool ready = wait_file_stable_closed(live_path, /*timeout_ms*/800, /*settle_ms*/120);
-    if (!ready) {
-      Serial.println("[HTTP] Snapshot no listo: espero 1000ms y reintento...");
-      vTaskDelay(pdMS_TO_TICKS(1000));  // PAUSA solicitada
-      ready = wait_file_stable_closed(live_path, /*timeout_ms*/800, /*settle_ms*/120);
-    }
-    // 2) Si aún no está listo, seguimos igualmente: el saneado descartará el último objeto parcial.
-    if (!ready) {
-      Serial.println("[HTTP] Forzamos snapshot tras la espera: confío en saneado para descartar el último objeto parcial.");
-    }
-
-    Serial.println("[HTTP] Preparando backlog para envío...");
-    sdjson_logger_stop(); // detenemos el writer para “congelar” el archivo
-
-    // ¿Quedó un archivo pendiente de un intento anterior?
-    bool pending_file_exists = false;
-    FILE* f_pending = fopen(sending_path, "r");
-    if (f_pending) { fclose(f_pending); pending_file_exists = true; }
-
-    // Renombramos el archivo “en vivo” a “_sending” si no hay uno pendiente
-    bool renamed_ok = false;
-    FILE* f_live = fopen(live_path, "r");
-    if (f_live) {
-      fclose(f_live);
-      if (!pending_file_exists) {
-        if (rename(live_path, sending_path) == 0) {
-          renamed_ok = true;
-          Serial.printf("[HTTP] Archivo '%s' renombrado a '%s'\n", live_path, sending_path);
-        } else {
-          Serial.println("[HTTP] ERROR: Falló el renombrado del archivo de backlog.");
+        // 1. Esperar un nuevo ciclo de recuento
+        if (xQueueReceive(gWifiHttpQueue, &m, portMAX_DELAY) != pdTRUE) {
+            continue;
         }
-      } else {
-        Serial.println("[HTTP] Hay un archivo pendiente de envío anterior, no se renombra el actual.");
-      }
-    } else {
-      Serial.println("[HTTP] No hay archivo de backlog 'en vivo' para enviar.");
+
+        // 2. LÓGICA UNIFICADA Y ASÍNCRONA: Crear y sellar el lote SIEMPRE
+        // Cada ciclo de recuento genera una nueva línea en la SD, sin importar el estado de la red.
+        if (netTimeReady()) {
+            char line[64];
+            snprintf(line, sizeof(line), "{\"t\":%lu,\"w\":%d}", (unsigned long)m.ts, m.wifi);
+            sdcard_append_jsonl(line);
+            sdcard_newline(); // Orden asíncrona de cerrar la línea
+            Serial.printf("[HTTP] Lote sellado en SD con ts=%lu\n", (unsigned long)m.ts);
+        } else {
+            Serial.println("[HTTP] Sin hora real: NO se guarda el resumen del lote en SD.");
+            // Aunque no guardemos el resumen {t,w}, sí cerramos la línea de MACs
+            // para que no se mezclen con el siguiente lote.
+            sdcard_newline();
+        }
+
+        // 3. PARTE CONDICIONAL: Intentar enviar si hay conexión
+        if (WiFi.status() != WL_CONNECTED) {
+             // Si no hay Wi-Fi, el trabajo de este ciclo (guardar en SD) ya está hecho.
+            Serial.println("[HTTP] Sin Wi-Fi, el lote sellado queda pendiente.");
+            continue;
+        }
+
+        // --- HAY WI-FI: PROCEDEMOS A INTENTAR ENVIAR EL BACKLOG ---
+        
+        // Pequeña pausa opcional para dar tiempo al writer de la SD a procesar la nueva línea
+        vTaskDelay(pdMS_TO_TICKS(150));
+
+        // Detenemos el writer para "congelar" el archivo de forma segura antes de manipularlo
+        sdjson_logger_stop();
+
+        // Comprobamos si quedó un archivo pendiente de un intento anterior fallido
+        bool pending_file_exists = false;
+        FILE* f_pending = fopen(sending_path, "r");
+        if (f_pending) {
+            fclose(f_pending);
+            pending_file_exists = true;
+        }
+
+        // Renombramos el archivo "en vivo" a "_sending" solo si no hay uno pendiente ya
+        bool renamed_ok = false;
+        FILE* f_live = fopen(live_path, "r");
+        if (f_live) {
+            fclose(f_live);
+            if (!pending_file_exists) {
+                if (rename(live_path, sending_path) == 0) {
+                    renamed_ok = true;
+                    Serial.printf("[HTTP] Snapshot creado: '%s' -> '%s'\n", live_path, sending_path);
+                } else {
+                    Serial.println("[HTTP] ERROR: Falló el renombrado del archivo de backlog.");
+                }
+            } else {
+                Serial.println("[HTTP] Hay un archivo pendiente de envío anterior, se priorizará ese.");
+            }
+        } else {
+            Serial.println("[HTTP] No hay archivo de backlog 'en vivo' para enviar.");
+        }
+
+        // Reiniciamos el writer inmediatamente para que pueda seguir guardando el siguiente lote
+        sdjson_logger_start();
+
+        // Intentamos enviar el archivo renombrado (o el que ya estaba pendiente)
+        if (renamed_ok || pending_file_exists) {
+            Serial.printf("[HTTP] Intentando POST del archivo '%s'...\n", sending_path);
+            bool post_ok = post_file_and_delete_on_ok(sending_path, m.wifi, m.ts);
+            if (!post_ok) {
+                Serial.println("[HTTP] POST falló. El archivo se conservará para el próximo intento.");
+            }
+        }
     }
-
-    // Reiniciamos el writer inmediatamente
-    sdjson_logger_start();
-
-    // Intentamos enviar el archivo renombrado (o el pendiente anterior)
-    if (renamed_ok || pending_file_exists) {
-      Serial.printf("[HTTP] Intentando POST del archivo '%s'...\n", sending_path);
-      bool post_ok = post_file_and_delete_on_ok(sending_path, m.wifi, m.ts);
-      if (!post_ok) {
-        Serial.println("[HTTP] POST falló. El archivo se conservará para el próximo intento.");
-      }
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(10));
-  }
 }
 
 

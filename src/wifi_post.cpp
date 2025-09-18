@@ -106,6 +106,7 @@ static bool compute_ndjson_stats(const char* path, NdjsonStats& st);
 static char last_non_ws_char_in_file(const char* path);
 static bool sanitize_snapshot_inplace(const char* path, size_t* out_kept, size_t* out_dropped);
 class NdjsonArrayStream;
+static bool wait_file_stable_closed(const char* path, uint32_t timeout_ms , uint32_t settle_ms );
 
 /* ────────────────────────────────────────────────────────────────────────── */
 
@@ -541,140 +542,134 @@ static bool post_file_and_delete_on_ok(const char* fullpath, int wifiCount, time
 /* ── Task principal ──────────────────────────────────────────────────────── */
 
 static void wifi_http_task(void *pvParameters) {
-  (void) pvParameters;
+    (void) pvParameters;
 
-  (void)connectToWiFi_local();
-  netTimeInit();
+    (void)connectToWiFi_local();
+    netTimeInit();
 
-  http_msg_t m;
+    http_msg_t m;
 
-  char live_path[96];
-  snprintf(live_path, sizeof(live_path), "%s/%s.jsonl", MOUNT_POINT, SDCARD_MACLOG_BASENAME);
+    char live_path[96];
+    snprintf(live_path, sizeof(live_path), "%s/%s.jsonl", MOUNT_POINT, SDCARD_MACLOG_BASENAME);
 
-  for (;;) {
-    if (gRebootScheduled) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
+    for (;;) {
+        if (gRebootScheduled) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
 
-    if (xQueueReceive(gWifiHttpQueue, &m, portMAX_DELAY) != pdTRUE) continue;
+        if (xQueueReceive(gWifiHttpQueue, &m, portMAX_DELAY) != pdTRUE) continue;
 
-    if (netTimeReady()) {
-      char line[64];
-      snprintf(line, sizeof(line), "{\"t\":%lu,\"w\":%d}", (unsigned long)m.ts, m.wifi);
-      sdcard_append_jsonl(line);
-    } else {
-      Serial.println("[HTTP] Sin hora real: NO se guarda {t,w}.");
-    }
-    sdcard_newline();
-    Serial.printf("[HTTP] Lote sellado en SD con ts=%lu\n", (unsigned long)m.ts);
-
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("[HTTP] Sin Wi-Fi, el lote queda pendiente.");
-      continue;
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(150));
-
-    // Congelar y mover live->sending si no hay pendiente
-    sdjson_logger_stop();
-
-    bool pending_exists = false;
-    { FILE* f = fopen(SENDING_PATH, "r"); if (f) { fclose(f); pending_exists = true; } }
-
-    bool renamed_ok = false;
-    {
-      FILE* f_live = fopen(live_path, "r");
-      if (f_live) {
-        fclose(f_live);
-        if (!pending_exists) {
-          if (rename(live_path, SENDING_PATH) == 0) {
-            renamed_ok = true;
-            reset_cursor(); // empezamos en offset 0
-            Serial.printf("[HTTP] Snapshot: '%s' -> '%s'\n", live_path, SENDING_PATH);
-          } else {
-            Serial.println("[HTTP] ERROR: Falló el renombrado del backlog.");
-          }
+        // 1. LÓGICA UNIFICADA: Crear y sellar el lote SIEMPRE
+        if (netTimeReady()) {
+            char line[64];
+            snprintf(line, sizeof(line), "{\"t\":%lu,\"w\":%d}", (unsigned long)m.ts, m.wifi);
+            sdcard_append_jsonl(line);
         } else {
-          Serial.println("[HTTP] Hay un archivo de cola pendiente; se prioriza ese.");
+            Serial.println("[HTTP] Sin hora real: NO se guarda {t,w}.");
         }
-      } else {
-        Serial.println("[HTTP] No hay backlog 'en vivo' para enviar.");
-      }
+        sdcard_newline(); // Sellamos la línea actual para definir el lote.
+        Serial.printf("[HTTP] Lote sellado en SD con ts=%lu\n", (unsigned long)m.ts);
+
+        // 2. PARTE CONDICIONAL: Si no hay Wi-Fi, el trabajo de este ciclo termina aquí.
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("[HTTP] Sin Wi-Fi, el lote queda pendiente.");
+            continue;
+        }
+
+        // --- HAY WI-FI: PROCEDEMOS A ENVIAR EL BACKLOG ---
+        
+        vTaskDelay(pdMS_TO_TICKS(150)); // Pequeño respiro para que el writer de la SD actúe
+
+        // 3. CREAR SNAPSHOT
+        // Congelar y mover live->sending si no hay un envío pendiente
+        sdjson_logger_stop();
+
+        bool pending_exists = false;
+        { FILE* f = fopen(SENDING_PATH, "r"); if (f) { fclose(f); pending_exists = true; } }
+
+        bool renamed_ok = false;
+        {
+            FILE* f_live = fopen(live_path, "r");
+            if (f_live) {
+                fclose(f_live);
+                if (!pending_exists) {
+                    if (rename(live_path, SENDING_PATH) == 0) {
+                        renamed_ok = true;
+                        reset_cursor(); // Empezamos a enviar el nuevo snapshot desde el principio
+                        Serial.printf("[HTTP] Snapshot creado: '%s' -> '%s'\n", live_path, SENDING_PATH);
+                    } else {
+                        Serial.println("[HTTP] ERROR: Falló el renombrado del backlog.");
+                    }
+                } else {
+                    Serial.println("[HTTP] Hay un archivo de cola pendiente; se prioriza ese.");
+                }
+            } else {
+                Serial.println("[HTTP] No hay backlog 'en vivo' para enviar.");
+            }
+        }
+        sdjson_logger_start();
+
+        // 4. VACIAR SNAPSHOT POR CHUNKS
+        if (renamed_ok || pending_exists) {
+            size_t cursor = 0; 
+            load_cursor(cursor);
+
+            for (;;) {
+                if (WiFi.status() != WL_CONNECTED) break;
+
+                FILE* fsz = fopen(SENDING_PATH, "rb");
+                if (!fsz) { remove(INDEX_PATH); break; }
+                fseek(fsz, 0, SEEK_END);
+                long filesize = ftell(fsz);
+                fclose(fsz);
+
+                if ((long)cursor >= filesize) {
+                    remove(SENDING_PATH); remove(INDEX_PATH);
+                    Serial.println("[HTTP] Cola de envío vaciada con éxito.");
+                    break;
+                }
+
+                size_t lines_read = 0, bytes_read = 0;
+                if (!make_chunk_from_offset(SENDING_PATH, CHUNK_PATH, MAX_LINES_PER_POST, cursor, &lines_read, &bytes_read)) {
+                    if ((long)cursor >= filesize) {
+                        remove(SENDING_PATH); remove(INDEX_PATH);
+                        Serial.println("[HTTP] Cola vacía (alcanzado EOF).");
+                    }
+                    break;
+                }
+
+                // El saneado del chunk es opcional pero recomendable
+                size_t kept = 0, dropped = 0;
+                sanitize_snapshot_inplace(CHUNK_PATH, &kept, &dropped);
+
+                NdjsonStats cst = {};
+                compute_ndjson_stats(CHUNK_PATH, cst);
+                if (cst.lines == 0 || cst.bytes == 0) {
+                    cursor += bytes_read; save_cursor(cursor);
+                    remove(CHUNK_PATH);
+                    continue;
+                }
+                
+                post_chunk(CHUNK_PATH, m.wifi, m.ts);
+                remove(CHUNK_PATH);
+
+                cursor += bytes_read;
+                save_cursor(cursor);
+
+                // Compactación ocasional
+                if (cursor > COMPACT_MIN_BYTES && (cursor * COMPACT_FRAC_DEN) > ((size_t)filesize * COMPACT_FRAC_NUM)) {
+                    Serial.printf("[HTTP] Compactando cola: cursor=%lu filesize=%ld\n", (unsigned long)cursor, filesize);
+                    if (compact_file_from_offset(SENDING_PATH, cursor)) {
+                        cursor = 0; save_cursor(cursor);
+                    } else {
+                        Serial.println("[HTTP] WARNING: compactación fallida.");
+                    }
+                }
+
+                vTaskDelay(pdMS_TO_TICKS(10)); // ceder CPU
+            }
+        }
     }
-    sdjson_logger_start();
-
-    // Vaciar por chunks usando offset
-    if (renamed_ok || pending_exists) {
-      size_t cursor=0; (void)load_cursor(cursor);
-
-      for (;;) {
-        if (WiFi.status() != WL_CONNECTED) break;
-
-        // Si el cursor ya está al final, limpiar y salir
-        FILE* fsz = fopen(SENDING_PATH, "rb");
-        if (!fsz) { remove(INDEX_PATH); break; }
-        fseek(fsz, 0, SEEK_END);
-        long filesize = ftell(fsz);
-        fclose(fsz);
-
-        if ((long)cursor >= filesize) {
-          remove(SENDING_PATH); remove(INDEX_PATH);
-          Serial.println("[HTTP] Cola vacía -> archivo eliminado.");
-          break;
-        }
-
-        // Crear chunk desde cursor
-        size_t lines_read=0, bytes_read=0;
-        if (!make_chunk_from_offset(SENDING_PATH, CHUNK_PATH, MAX_LINES_PER_POST, cursor, &lines_read, &bytes_read)) {
-          // Nada que leer ahora (posibles líneas vacías finales); pasamos a limpiar si procede
-          if ((long)cursor >= filesize) {
-            remove(SENDING_PATH); remove(INDEX_PATH);
-            Serial.println("[HTTP] Cola vacía (EOF).");
-          }
-          break;
-        }
-
-        // Saneado rápido del chunk
-        size_t kept=0, dropped=0;
-        if (!sanitize_snapshot_inplace(CHUNK_PATH, &kept, &dropped)) {
-          Serial.println("[SAN] ERROR saneando chunk; se avanza igualmente para evitar bloqueo.");
-          // Avanzamos offset igualmente
-          cursor += bytes_read; save_cursor(cursor);
-          remove(CHUNK_PATH);
-          continue;
-        }
-
-        // Si quedó vacío tras saneado, avanzar y seguir
-        NdjsonStats cst={}; (void)compute_ndjson_stats(CHUNK_PATH, cst);
-        if (cst.lines == 0 || cst.bytes == 0) {
-          cursor += bytes_read; save_cursor(cursor);
-          remove(CHUNK_PATH);
-          continue;
-        }
-
-        // POST del chunk
-        int code = post_chunk(CHUNK_PATH, m.wifi, m.ts);
-        remove(CHUNK_PATH);
-
-        // Avanzamos SIEMPRE (OK o FAIL), como acordado
-        cursor += bytes_read;
-        save_cursor(cursor);
-
-        // Compactación ocasional para no dejar crecer el offset indefinidamente
-        if (cursor > COMPACT_MIN_BYTES && (cursor * COMPACT_FRAC_DEN) > ((size_t)filesize * COMPACT_FRAC_NUM)) {
-          Serial.printf("[HTTP] Compactando cola: cursor=%lu filesize=%ld\n", (unsigned long)cursor, filesize);
-          if (compact_file_from_offset(SENDING_PATH, cursor)) {
-            cursor = 0; save_cursor(cursor);
-          } else {
-            Serial.println("[HTTP] WARNING: compactación fallida; se reintentará más tarde.");
-          }
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(10)); // ceder CPU
-      }
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(10));
-  }
 }
+
 
 /* ── Purga cada 6 minutos si no hay Internet ─────────────────────────────── */
 
@@ -734,27 +729,62 @@ static void post_reset_watchdog_task(void *pvParameters) {
 /* ── Init / API ─────────────────────────────────────────────────────────── */
 
 void wifi_post_init(void) {
-  esp_bt_controller_mem_release(ESP_BT_MODE_BTDM);
+    esp_bt_controller_mem_release(ESP_BT_MODE_BTDM);
 
-  if (!gWifiHttpQueue)
-    gWifiHttpQueue = xQueueCreate(20, sizeof(http_msg_t));
-  if (!gWifiHttpTask) {
-    xTaskCreatePinnedToCore(
-      wifi_http_task, "wifi_http_task", 12288, NULL, 1, &gWifiHttpTask, 1
-    );
-  }
-  if (!gPurgeTask) {
-    xTaskCreatePinnedToCore(
-      backlog_purge_task, "sd_purge_task", 4096, NULL, 1, &gPurgeTask, 1
-    );
-  }
-  if (!gPostResetTask) {
-    uint32_t nowTick = xTaskGetTickCount();
-    gLastPostTryTick = nowTick;
-    gLastPostOkTick  = nowTick;
-    xTaskCreatePinnedToCore(
-      post_reset_watchdog_task, "post_reset_wd", 4096, NULL, 1, &gPostResetTask, 1
-    );
+    if (!gWifiHttpQueue)
+        gWifiHttpQueue = xQueueCreate(20, sizeof(http_msg_t)); // Aumentado de 8 a 20
+
+    if (!gWifiHttpTask) {
+        xTaskCreatePinnedToCore(
+            wifi_http_task, "wifi_http_task", 12288, NULL, 1, &gWifiHttpTask, 1
+        );
+    }
+    if (!gPurgeTask) {
+        xTaskCreatePinnedToCore(
+            backlog_purge_task, "sd_purge_task", 4096, NULL, 1, &gPurgeTask, 1
+        );
+    }
+    if (!gPostResetTask) {
+        uint32_t nowTick = xTaskGetTickCount();
+        gLastPostTryTick = nowTick;
+        gLastPostOkTick  = nowTick;
+        xTaskCreatePinnedToCore(
+            post_reset_watchdog_task, "post_reset_wd", 4096, NULL, 1, &gPostResetTask, 1
+        );
+    }
+}
+// Espera a que el archivo termine en '}' y su tamaño se mantenga estable unos ms.
+static bool wait_file_stable_closed(const char* path,
+                                    uint32_t timeout_ms = 800,
+                                    uint32_t settle_ms  = 120) {
+  uint32_t start = millis();
+  long last_sz = -1;
+  uint32_t last_change = millis();
+
+  for (;;) {
+    long cur_sz = -1;
+    FILE* f = fopen(path, "rb");
+    if (f) {
+      fseek(f, 0, SEEK_END);
+      cur_sz = ftell(f);
+      fclose(f);
+    }
+
+    if (cur_sz != last_sz) {
+      last_sz = cur_sz;
+      last_change = millis();
+    }
+
+    char tail = last_non_ws_char_in_file(path);
+    if (tail == '}' && last_sz > 0 && (millis() - last_change) >= settle_ms) {
+      return true; // listo para snapshot
+    }
+
+    if ((millis() - start) >= timeout_ms) {
+      return false; // timeout
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
 

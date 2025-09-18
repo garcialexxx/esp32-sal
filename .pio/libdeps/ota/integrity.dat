@@ -1,0 +1,20 @@
+lewapek/Nova Fitness Sds dust sensors library @ ^1.5.1
+boschsensortec/BSEC Software Library @ 1.8.1492
+adafruit/Adafruit Unified Sensor @ ^1.1.14
+bblanchon/ArduinoJson @ ^6.21.5
+fastled/FastLED @ ^3.9.13
+makuna/RTC @ ^2.5.0
+bitbank2/bb_spi_lcd @ 2.4.4
+bitbank2/OneBitDisplay @ ^2.3.2
+adafruit/Adafruit BMP280 Library@ ^2.6.8
+mathertel/OneButton @ ^2.5.0
+mcci-catena/MCCI LoRaWAN LMIC library @ ^5.0.1
+256dpi/MQTT @ ^2.5.2
+https://github.com/SukkoPera/Arduino-Rokkit-Hash.git
+adafruit/Adafruit BMP085 Library @ ^1.2.4
+https://github.com/cyberman54/libpax.git
+lewisxhe/XPowersLib @ ^0.2.7
+ricmoo/QRCode @ ^0.0.1
+mikalhart/TinyGPSPlus @ ^1.0.3
+seeed-studio/Ultrathin_LED_Matrix @ ^1.0.0
+adafruit/Adafruit BME280 Library @ ^2.2.4
